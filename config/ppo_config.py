@@ -26,6 +26,6 @@ class PPOConfig:
     log_interval: int = 10
     
     # Exploration
-    epsilon: float = 0.1
-    epsilon_decay: float = 0.995
-    min_epsilon: float = 0.05
+    epsilon: float = 0.5
+    epsilon_decay: float = 0.99
+    min_epsilon: float = 0.01

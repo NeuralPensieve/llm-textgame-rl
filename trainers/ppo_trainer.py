@@ -8,6 +8,7 @@ import logging
 import os
 from tqdm import tqdm
 import wandb
+from torch.amp import GradScaler, autocast
 
 from env import TextWorldEnvironment
 from config import PPOConfig
@@ -47,6 +48,9 @@ class PPOTextWorldTrainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.num_iterations, eta_min=1e-6
         )
+
+        # Initialize GradScaler for FP16 training
+        self.scaler = GradScaler(enabled=torch.cuda.is_available())
         
         # Training state
         self.iteration = 0
@@ -93,7 +97,7 @@ class PPOTextWorldTrainer:
                 env_indices.append(i)
             
             # Evaluate actions with no cache
-            with torch.no_grad():
+            with torch.no_grad(), autocast(self.device.type):
                 action_logprobs, values = self.policy.evaluate_for_rollout(batch_states, batch_actions)
             
             # Step each environment
@@ -150,7 +154,7 @@ class PPOTextWorldTrainer:
             
             states = new_states
         
-         # Store metrics for truncated episodes
+        # Store metrics for truncated episodes
         for i, (length, reward) in enumerate(zip(episode_lengths, episode_rewards)):
             if length > 0:  # Only include non-zero length episodes
                 all_episode_lengths.append(length)
@@ -262,39 +266,42 @@ class PPOTextWorldTrainer:
                 
                 try:
                     # Forward pass
-                    current_action_logprobs, current_values = self.policy.evaluate_actions(
-                        batch_states, batch_action_lists)
-                    
-                    # Extract logprobs for chosen actions
-                    current_logprobs = torch.stack([
-                        current_action_logprobs[i][action_idx] 
-                        for i, action_idx in enumerate(batch_action_indices)
-                    ])
-                    
-                    current_values = current_values.squeeze()
-                    
-                    # Compute losses
-                    ratio = torch.exp(current_logprobs - batch_old_logprobs)
-                    surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1 - self.config.epsilon_clip, 1 + self.config.epsilon_clip) * batch_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    value_loss = F.mse_loss(current_values, batch_returns)
+                    with autocast(self.device.type):
+                        current_action_logprobs, current_values = self.policy.evaluate_actions(
+                            batch_states, batch_action_lists)
+                        
+                        # Extract logprobs for chosen actions
+                        current_logprobs = torch.stack([
+                            current_action_logprobs[i][action_idx] 
+                            for i, action_idx in enumerate(batch_action_indices)
+                        ])
+                        
+                        current_values = current_values.squeeze()
+                        
+                        # Compute losses
+                        ratio = torch.exp(current_logprobs - batch_old_logprobs)
+                        surr1 = ratio * batch_advantages
+                        surr2 = torch.clamp(ratio, 1 - self.config.epsilon_clip, 1 + self.config.epsilon_clip) * batch_advantages
+                        policy_loss = -torch.min(surr1, surr2).mean()
+                        value_loss = F.mse_loss(current_values, batch_returns)
 
-                    # Add KL regularization (if we have old logits stored)
-                    kl_loss = torch.tensor(0.0, device=self.device)
-                    if epoch == 0 and old_logits_list:
-                        l2_reg = sum(p.pow(2.0).sum() for p in self.policy.value_head.parameters())
-                        kl_loss = 0.001 * l2_reg
-                    
-                    total_loss = (policy_loss + 
-                                self.config.value_loss_coef * value_loss + 
-                                0.01 * kl_loss)
+                        # Add KL regularization (if we have old logits stored)
+                        kl_loss = torch.tensor(0.0, device=self.device)
+                        if epoch == 0 and old_logits_list:
+                            l2_reg = sum(p.pow(2.0).sum() for p in self.policy.value_head.parameters())
+                            kl_loss = 0.001 * l2_reg
+                        
+                        total_loss = (policy_loss + 
+                                    self.config.value_loss_coef * value_loss + 
+                                    0.01 * kl_loss)
                     
                     # Backward pass
                     self.optimizer.zero_grad()
-                    total_loss.backward()
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-                    self.optimizer.step()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                     
                     # Accumulate metrics
                     total_policy_loss += policy_loss.item()
@@ -304,7 +311,6 @@ class PPOTextWorldTrainer:
                     
                 except Exception as e:
                     self.logger.error(f"Error in PPO update: {e}")
-                    # exit the program if an error occurs
                     raise e
         
         # Update learning rate
@@ -365,9 +371,34 @@ class PPOTextWorldTrainer:
             
             if iteration % self.config.log_interval == 0:
                 self.logger.info(f"Iteration {iteration}: Avg Reward: {avg_reward:.4f}, "
-                               f"Avg Episode Length: {avg_episode_length:.2f}, "
-                               f"Avg Episode Reward: {avg_episode_reward:.4f}, "
-                               f"Total Episode Reward: {total_episode_reward:.4f}")
+                            f"Avg Episode Length: {avg_episode_length:.2f}, "
+                            f"Avg Episode Reward: {avg_episode_reward:.4f}, "
+                            f"Total Episode Reward: {total_episode_reward:.4f}")
+            
+            # Log 4 game examples every 10 training steps
+            if iteration % 10 == 0 and rollout_buffer:
+                self.logger.info(f"Logging 4 game examples at iteration {iteration}")
+                # Randomly select up to 4 experiences from the rollout buffer
+                sample_indices = random.sample(range(len(rollout_buffer)), min(4, len(rollout_buffer)))
+                for idx, exp_idx in enumerate(sample_indices):
+                    exp = rollout_buffer[exp_idx]
+                    self.logger.info(f"Game Example {idx + 1}:")
+                    self.logger.info(f"  Environment: {exp['env_idx']}, Episode: {exp['episode_id']}")
+                    self.logger.info(f"  State: {exp['state']}")
+                    self.logger.info(f"  Available Actions: {exp['available_actions']}")
+                    self.logger.info(f"  Chosen Action: {exp['action']}")
+                    self.logger.info(f"  Reward: {exp['reward']:.4f}")
+                    self.logger.info(f"  Done: {exp['done']}")
+                    self.logger.info(f"  Truncated: {exp['truncated']}")
+                    # Log to wandb as well
+                    wandb.log({
+                        f"game_example_{idx + 1}_iteration_{iteration}/state": exp['state'],
+                        f"game_example_{idx + 1}_iteration_{iteration}/actions": exp['available_actions'],
+                        f"game_example_{idx + 1}_iteration_{iteration}/chosen_action": exp['action'],
+                        f"game_example_{idx + 1}_iteration_{iteration}/reward": exp['reward'],
+                        f"game_example_{idx + 1}_iteration_{iteration}/done": exp['done'],
+                        f"game_example_{idx + 1}_iteration_{iteration}/truncated": exp['truncated'],
+                    })
             
             # Save checkpoint
             if iteration % self.config.save_interval == 0:
@@ -382,6 +413,7 @@ class PPOTextWorldTrainer:
             'iteration': iteration,
             'model_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),  # Save scaler state
             'config': self.config,
             'epsilon': self.epsilon
         }
@@ -395,6 +427,7 @@ class PPOTextWorldTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scaler.load_state_dict(checkpoint.get('scaler_state_dict', {}))  # Load scaler state
         self.iteration = checkpoint['iteration']
         self.epsilon = checkpoint['epsilon']
         self.logger.info(f"Checkpoint loaded: {checkpoint_path}")

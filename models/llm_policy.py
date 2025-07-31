@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Tuple
 import logging
+from torch.amp import autocast
 
 from config import PPOConfig
 
@@ -68,23 +69,24 @@ class LLMPolicy(nn.Module):
         self.logger.info(f"Cached target tokens: {self.target_tokens}")
     
     def forward(self, input_ids, attention_mask=None):
-        """Forward pass through model"""
+        """Forward pass through model with FP16"""
         try:
-            outputs = self.model(
-                input_ids=input_ids, 
-                attention_mask=attention_mask, 
-                output_hidden_states=True
-            )
+            with autocast(self.model.device.type):
+                outputs = self.model(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    output_hidden_states=True
+                )
+                # Get hidden states from last layer
+                hidden_states = outputs.hidden_states[-1]
+                
+                # Use last token's representation for value estimation
+                last_hidden = hidden_states[:, -1, :]
+                value = self.value_head(last_hidden)
+        
         except Exception as e:
             self.logger.error(f"Model forward pass failed: {e}")
             raise
-        
-        # Get hidden states from last layer
-        hidden_states = outputs.hidden_states[-1]
-        
-        # Use last token's representation for value estimation
-        last_hidden = hidden_states[:, -1, :]
-        value = self.value_head(last_hidden)
         
         return outputs.logits, value
     
@@ -153,12 +155,13 @@ class LLMPolicy(nn.Module):
         value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
         
         # Forward pass for actions
-        action_logits, _ = self.forward(**action_inputs)
-        action_logprobs = F.log_softmax(action_logits[:, -1, :], dim=-1)
+        with autocast(self.model.device.type):
+            action_logits, _ = self.forward(**action_inputs)
+            action_logprobs = F.log_softmax(action_logits[:, -1, :], dim=-1)
 
-        # Forward pass for values
-        value_logits, _ = self.forward(**value_inputs)
-        value_logprobs = F.log_softmax(value_logits[:, -1, :], dim=-1)
+            # Forward pass for values
+            value_logits, _ = self.forward(**value_inputs)
+            value_logprobs = F.log_softmax(value_logits[:, -1, :], dim=-1)
         
         # Compute scores using improved methods
         env_action_logprobs = self.compute_action_scores(action_logprobs, metadata, len(states))
@@ -185,7 +188,7 @@ class LLMPolicy(nn.Module):
                 inputs = self.tokenize_prompts(action_prompts)
                 inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
                 
-                with torch.no_grad():
+                with torch.no_grad(), autocast(self.model.device.type):
                     logits, _ = self.forward(**inputs)
                     logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
                     
@@ -203,7 +206,7 @@ class LLMPolicy(nn.Module):
             value_inputs = self.tokenize_prompts([value_prompt])
             value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
             
-            with torch.no_grad():
+            with torch.no_grad(), autocast(self.model.device.type):
                 logits, _ = self.forward(**value_inputs)
                 logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
                 
@@ -220,14 +223,14 @@ class LLMPolicy(nn.Module):
     
     def get_kl_loss(self, new_logits: torch.Tensor, old_logits: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence loss to prevent catastrophic forgetting"""
-        new_probs = F.softmax(new_logits, dim=-1)
-        old_probs = F.softmax(old_logits.detach(), dim=-1)
-        
-        kl_loss = F.kl_div(
-            F.log_softmax(new_logits, dim=-1),
-            old_probs,
-            reduction='batchmean'
-        )
+        with autocast(self.model.device.type):
+            old_probs = F.softmax(old_logits.detach(), dim=-1)
+            
+            kl_loss = F.kl_div(
+                F.log_softmax(new_logits, dim=-1),
+                old_probs,
+                reduction='batchmean'
+            )
         
         return kl_loss
     
@@ -237,7 +240,7 @@ class LLMPolicy(nn.Module):
         
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         
-        with torch.no_grad():
+        with torch.no_grad(), autocast(self.model.device.type):
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
