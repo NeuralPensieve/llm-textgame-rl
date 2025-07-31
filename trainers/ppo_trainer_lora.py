@@ -9,14 +9,15 @@ import os
 from tqdm import tqdm
 import wandb
 from torch.amp import GradScaler, autocast
+from peft import LoraConfig, get_peft_model, TaskType
 
 from env import TextWorldEnvironment
 from config import PPOConfig
 from models import LLMPolicy
 
 
-class PPOTextWorldTrainer:
-    """Simplified PPO trainer for TextWorld"""
+class PPOLoRATextWorldTrainer:
+    """PPO trainer for TextWorld with LoRA adaptation"""
     
     def __init__(self, config: PPOConfig):
         self.config = config
@@ -35,14 +36,20 @@ class PPOTextWorldTrainer:
         # Create environments and policy
         self.envs = [TextWorldEnvironment() for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
+        
+        # Setup LoRA configuration
+        self._setup_lora()
 
         # Disable cache for transformer models during training
         if hasattr(self.policy, 'config'):
             self.policy.config.use_cache = False
 
-        # Improved optimizer with separate learning rates
-        param_groups = self.policy.get_separate_parameter_groups()
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+        # Optimizer for LoRA parameters only
+        self.optimizer = torch.optim.AdamW(
+            self.policy.parameters(), 
+            lr=config.learning_rate,
+            weight_decay=0.01
+        )
         
         # Add learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -57,6 +64,54 @@ class PPOTextWorldTrainer:
         self.epsilon = config.epsilon
         
         os.makedirs("checkpoints", exist_ok=True)
+        
+        # Log parameter counts
+        self._log_parameter_counts()
+    
+    def _setup_lora(self):
+        """Setup LoRA configuration and apply to the model"""
+        # LoRA configuration - adjust these parameters based on your needs
+        lora_config = LoraConfig(
+            r=self.config.lora_rank,  # Low-rank dimension (smaller = fewer parameters, less expressiveness)
+            lora_alpha=2 * self.config.lora_rank,  # LoRA scaling parameter (typically 2*r)
+            target_modules="all-linear",  # Apply LoRA to all linear layers
+            lora_dropout=self.config.lora_dropout,  # Dropout for LoRA layers
+            bias="none",  # Don't adapt bias parameters
+            task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
+            inference_mode=False,  # Set to False for training
+        )
+        
+        # Apply LoRA to the policy model
+        # Note: This assumes your LLMPolicy has a base transformer model
+        # You may need to adjust this based on your model structure
+        if hasattr(self.policy, 'base_model') or hasattr(self.policy, 'model'):
+            base_model = getattr(self.policy, 'base_model', None) or getattr(self.policy, 'model', None)
+            if base_model is not None:
+                self.policy.base_model = get_peft_model(base_model, lora_config)
+                self.logger.info("LoRA applied to base model")
+            else:
+                self.logger.warning("Could not find base model to apply LoRA. Applying to entire policy.")
+                self.policy = get_peft_model(self.policy, lora_config)
+        else:
+            # Apply LoRA to the entire policy if no base model is found
+            self.policy = get_peft_model(self.policy, lora_config)
+            self.logger.info("LoRA applied to entire policy model")
+    
+    def _log_parameter_counts(self):
+        """Log the number of trainable vs total parameters"""
+        total_params = sum(p.numel() for p in self.policy.parameters())
+        trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        
+        self.logger.info(f"Total parameters: {total_params:,}")
+        self.logger.info(f"Trainable parameters: {trainable_params:,}")
+        self.logger.info(f"Trainable percentage: {100 * trainable_params / total_params:.2f}%")
+        
+        # Log to wandb
+        wandb.log({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "trainable_percentage": 100 * trainable_params / total_params
+        })
     
     def _setup_logging(self):
         """Setup logging and wandb"""
@@ -225,7 +280,7 @@ class PPOTextWorldTrainer:
         return advantages, returns
     
     def ppo_update(self, rollout_buffer: List[Dict]):
-        """PPO policy update"""
+        """PPO policy update with LoRA"""
         advantages, returns = self.compute_advantages(rollout_buffer)
         
         # Convert to tensors
@@ -233,9 +288,6 @@ class PPOTextWorldTrainer:
         returns = torch.FloatTensor(returns).to(self.device)
         old_logprobs = torch.FloatTensor([exp['old_logprob'] for exp in rollout_buffer]).to(self.device)
 
-        # Store old logits for KL regularization
-        old_logits_list = []
-        
         # Training metrics
         total_policy_loss = 0
         total_value_loss = 0
@@ -285,15 +337,17 @@ class PPOTextWorldTrainer:
                         policy_loss = -torch.min(surr1, surr2).mean()
                         value_loss = F.mse_loss(current_values, batch_returns)
 
-                        # Add KL regularization (if we have old logits stored)
+                        # Add L2 regularization for LoRA parameters
                         kl_loss = torch.tensor(0.0, device=self.device)
-                        if epoch == 0 and old_logits_list:
-                            l2_reg = sum(p.pow(2.0).sum() for p in self.policy.value_head.parameters())
-                            kl_loss = 0.001 * l2_reg
+                        if hasattr(self.policy, 'peft_config'):
+                            # Apply light regularization to LoRA parameters
+                            l2_reg = sum(p.pow(2.0).sum() for n, p in self.policy.named_parameters() 
+                                       if 'lora' in n.lower() and p.requires_grad)
+                            kl_loss = 0.0001 * l2_reg  # Lighter regularization for LoRA
                         
                         total_loss = (policy_loss + 
                                     self.config.value_loss_coef * value_loss + 
-                                    0.01 * kl_loss)
+                                    kl_loss)
                     
                     # Backward pass
                     self.optimizer.zero_grad()
@@ -341,7 +395,7 @@ class PPOTextWorldTrainer:
     
     def train(self):
         """Main training loop"""
-        self.logger.info("Starting PPO training...")
+        self.logger.info("Starting PPO training with LoRA...")
         
         for iteration in range(self.config.num_iterations):
             self.iteration = iteration
@@ -384,18 +438,25 @@ class PPOTextWorldTrainer:
         self.logger.info("Training completed!")
     
     def save_checkpoint(self, iteration: int):
-        """Save training checkpoint"""
+        """Save training checkpoint with LoRA adapters"""
         checkpoint = {
             'iteration': iteration,
             'model_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scaler_state_dict': self.scaler.state_dict(),  # Save scaler state
+            'scaler_state_dict': self.scaler.state_dict(),
             'config': self.config,
             'epsilon': self.epsilon
         }
         
-        checkpoint_path = f"checkpoints/ppo_textworld_iter_{iteration}.pt"
+        checkpoint_path = f"checkpoints/ppo_lora_textworld_iter_{iteration}.pt"
         torch.save(checkpoint, checkpoint_path)
+        
+        # Also save just the LoRA adapters for easier loading
+        if hasattr(self.policy, 'save_pretrained'):
+            lora_path = f"checkpoints/lora_adapters_iter_{iteration}"
+            self.policy.save_pretrained(lora_path)
+            self.logger.info(f"LoRA adapters saved: {lora_path}")
+        
         self.logger.info(f"Checkpoint saved: {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
@@ -403,7 +464,24 @@ class PPOTextWorldTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scaler.load_state_dict(checkpoint.get('scaler_state_dict', {}))  # Load scaler state
+        self.scaler.load_state_dict(checkpoint.get('scaler_state_dict', {}))
         self.iteration = checkpoint['iteration']
         self.epsilon = checkpoint['epsilon']
         self.logger.info(f"Checkpoint loaded: {checkpoint_path}")
+    
+    def load_lora_adapters(self, lora_path: str):
+        """Load only LoRA adapters (useful for inference)"""
+        if hasattr(self.policy, 'load_adapter'):
+            self.policy.load_adapter(lora_path)
+            self.logger.info(f"LoRA adapters loaded: {lora_path}")
+        else:
+            self.logger.warning("Policy does not support loading LoRA adapters")
+    
+    def merge_and_save_full_model(self, save_path: str):
+        """Merge LoRA weights with base model and save full model"""
+        if hasattr(self.policy, 'merge_and_unload'):
+            merged_model = self.policy.merge_and_unload()
+            torch.save(merged_model.state_dict(), save_path)
+            self.logger.info(f"Merged model saved: {save_path}")
+        else:
+            self.logger.warning("Policy does not support merging LoRA weights")
