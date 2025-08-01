@@ -115,8 +115,7 @@ class PPOTextWorldTrainer:
 
                 # Compute logits for the chosen action
                 with torch.no_grad(), autocast(self.device.type):
-                    action_prompt = [f"In game state: {state}, best action is {chosen_action}" if self.config.use_action_token_scoring 
-                                    else f"In this text adventure:\n{state}\n\nConsidering action: {chosen_action}\nThis action is helpful"]
+                    action_prompt = [f"In game state: {state}, best action is {chosen_action}"]
                     inputs = self.policy.tokenize_prompts(action_prompt)
                     inputs = {k: v.to(self.device) for k, v in inputs.items()}
                     logits, _ = self.policy(**inputs)
@@ -288,8 +287,7 @@ class PPOTextWorldTrainer:
 
                     # Compute new logits for KL loss
                     action_prompts = [
-                        f"In game state: {state}, best action is {action}" if self.config.use_action_token_scoring 
-                        else f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                        f"In game state: {state}, best action is {action}"
                         for state, action in zip(batch_states, [exp['action'] for exp in batch_experiences])
                     ]
                     action_inputs = self.policy.tokenize_prompts(action_prompts)
@@ -360,8 +358,7 @@ class PPOTextWorldTrainer:
                             f"Value Loss: {total_value_loss/num_updates:.4f}, "
                             f"KL Loss: {total_kl_loss/num_updates:.4f}, "
                             f"LR: {current_lr:.2e}, "
-                            f"Epsilon: {self.epsilon:.4f}, "
-                            f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}")
+                            f"Epsilon: {self.epsilon:.4f}, ")
             
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -400,8 +397,7 @@ class PPOTextWorldTrainer:
                 self.logger.info(f"Iteration {iteration}: Avg Reward: {avg_reward:.4f}, "
                             f"Avg Episode Length: {avg_episode_length:.2f}, "
                             f"Avg Episode Reward: {avg_episode_reward:.4f}, "
-                            f"Total Episode Reward: {total_episode_reward:.4f}, "
-                            f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}")
+                            f"Total Episode Reward: {total_episode_reward:.4f}, ")
             
             
             # Save checkpoint

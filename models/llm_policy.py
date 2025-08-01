@@ -96,10 +96,7 @@ class LLMPolicy(nn.Module):
         
         for i, (state, actions) in enumerate(zip(states, action_lists)):
             for action in actions:
-                if self.config.use_action_token_scoring:
-                    prompt = f"In game state: {state}, best action is {action}"
-                else:
-                    prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                prompt = f"In game state: {state}, best action is {action}"
                 action_prompts.append(prompt)
                 metadata.append((i, action.strip()))
             
@@ -162,55 +159,44 @@ class LLMPolicy(nn.Module):
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
         
-        if self.config.use_action_token_scoring:
-            logprobs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+        logprobs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+        
+        for idx, ((env_idx, action), prompt) in enumerate(zip(metadata, action_prompts)):
+            if not action.strip():
+                raise ValueError(f"Empty or whitespace action for env_idx {env_idx}: {action}")
+                
             
-            for idx, ((env_idx, action), prompt) in enumerate(zip(metadata, action_prompts)):
-                if not action.strip():
-                    raise ValueError(f"Empty or whitespace action for env_idx {env_idx}: {action}")
-                    
-                
-                # Tokenize action with leading space for BPE-based tokenizers
-                action_clean = action.strip()
-                action_tokens = self.tokenizer.encode(' ' + action_clean, add_special_tokens=False)
-                
-                n = len(action_tokens)
-                prompt_tokens = input_ids[idx][-n:].cpu().tolist()
-                
-                # Validate token alignment
-                if prompt_tokens != action_tokens:
-                    prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
-                    action_token_strings = self.tokenizer.convert_ids_to_tokens(action_tokens)
-                    raise ValueError(
-                        f"Token mismatch for action '{action_clean}' (env_idx {env_idx}). "
-                        f"Expected tokens: {action_tokens} ({action_token_strings}), "
-                        f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
-                    )
-                
-                # Compute score
-                logprobs_i = logprobs[idx, -n:]  # shape: [n, vocab_size]
-                if logprobs_i.shape[0] < n:
-                    raise ValueError(f"Insufficient tokens for action: {action_clean}. Expected {n}, got {logprobs_i.shape[0]}")
-                
-                actions_tensor = torch.tensor(action_tokens, device=logits.device)  # shape: [n]
-                selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
-                score = selected.mean()  # Keep as tensor
-                env_action_logprobs[env_idx].append(score)
-        else:
-            logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-            helpful_token_id = self.target_tokens["helpful"]
-            for (env_idx, action), logprob_dist in zip(metadata, logprobs):
-                if not action.strip():
-                    self.logger.warning(f"Empty or whitespace action for env_idx {env_idx}: {action}")
-                    env_action_logprobs[env_idx].append(torch.tensor(-10.0, device=logits.device))
-                    continue
-                score = logprob_dist[helpful_token_id]
-                env_action_logprobs[env_idx].append(score)
+            # Tokenize action with leading space for BPE-based tokenizers
+            action_clean = action.strip()
+            action_tokens = self.tokenizer.encode(' ' + action_clean, add_special_tokens=False)
+            
+            n = len(action_tokens)
+            prompt_tokens = input_ids[idx][-n:].cpu().tolist()
+            
+            # Validate token alignment
+            if prompt_tokens != action_tokens:
+                prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
+                action_token_strings = self.tokenizer.convert_ids_to_tokens(action_tokens)
+                raise ValueError(
+                    f"Token mismatch for action '{action_clean}' (env_idx {env_idx}). "
+                    f"Expected tokens: {action_tokens} ({action_token_strings}), "
+                    f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
+                )
+            
+            # Compute score
+            logprobs_i = logprobs[idx, -n:]  # shape: [n, vocab_size]
+            if logprobs_i.shape[0] < n:
+                raise ValueError(f"Insufficient tokens for action: {action_clean}. Expected {n}, got {logprobs_i.shape[0]}")
+            
+            actions_tensor = torch.tensor(action_tokens, device=logits.device)  # shape: [n]
+            selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
+            score = selected.mean()  # Keep as tensor
+            env_action_logprobs[env_idx].append(score)
         
         # Ensure non-empty lists
         for env_idx in range(num_states):
             if not env_action_logprobs[env_idx]:
-                raise ValueError(f"No action scores computed for env_idx {env_idx}. Using fallback score.")
+                raise ValueError(f"No action scores computed for env_idx {env_idx}.")
         
         return env_action_logprobs
     
@@ -250,10 +236,7 @@ class LLMPolicy(nn.Module):
         for state, actions in zip(states, action_lists):
             prompt_actions = []
             for action in actions:
-                if self.config.use_action_token_scoring:
-                    prompt = f"In game state: {state}, best action is {action}"
-                else:
-                    prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                prompt = f"In game state: {state}, best action is {action}"
                 prompt_actions.append(prompt)
             
             inputs = self.tokenize_prompts(prompt_actions)
@@ -261,54 +244,48 @@ class LLMPolicy(nn.Module):
             
             with torch.no_grad(), autocast(self.model.device.type):
                 logits, _ = self.forward(**inputs)
-                if self.config.use_action_token_scoring:
-                    action_scores = []
-                    logprobs = F.log_softmax(logits, dim=-1)  # [action_batch, seq_len, vocab_size]
+                action_scores = []
+                logprobs = F.log_softmax(logits, dim=-1)  # [action_batch, seq_len, vocab_size]
 
-                    # We add a space before each action to ensure tokenization matches
-                    actions = [f" {action}" for action in actions]
-                    actions_tokens = [self.tokenizer.encode(action, add_special_tokens=False) for action in actions]
+                # We add a space before each action to ensure tokenization matches
+                actions = [f" {action}" for action in actions]
+                actions_tokens = [self.tokenizer.encode(action, add_special_tokens=False) for action in actions]
 
-                    action_batch_size = len(actions_tokens)
-                    input_ids = inputs['input_ids']  # [batch, seq_len]
+                action_batch_size = len(actions_tokens)
+                input_ids = inputs['input_ids']  # [batch, seq_len]
 
-                    for i in range(action_batch_size):
-                        n = len(actions_tokens[i])
+                for i in range(action_batch_size):
+                    n = len(actions_tokens[i])
 
-                        # Get last n tokens from prompt's input_ids
-                        prompt_tokens = input_ids[i][-n:].cpu().tolist()
-                        expected_tokens = actions_tokens[i]
+                    # Get last n tokens from prompt's input_ids
+                    prompt_tokens = input_ids[i][-n:].cpu().tolist()
+                    expected_tokens = actions_tokens[i]
 
-                        # Validate token alignment
-                        if prompt_tokens != expected_tokens:
-                            prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
-                            expected_token_strings = self.tokenizer.convert_ids_to_tokens(expected_tokens)
-                            self.logger.error(
-                                f"Token mismatch for action '{actions[i]}'. "
-                                f"Expected tokens: {expected_tokens} ({expected_token_strings}), "
-                                f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
-                            )
-                            raise ValueError(
-                                f"Action tokens do not match prompt tokens for action '{actions[i]}'. "
-                                f"Expected: {expected_token_strings}, Got: {prompt_token_strings}. "
-                                "Check tokenizer compatibility or prompt structure."
-                            )
+                    # Validate token alignment
+                    if prompt_tokens != expected_tokens:
+                        prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
+                        expected_token_strings = self.tokenizer.convert_ids_to_tokens(expected_tokens)
+                        self.logger.error(
+                            f"Token mismatch for action '{actions[i]}'. "
+                            f"Expected tokens: {expected_tokens} ({expected_token_strings}), "
+                            f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
+                        )
+                        raise ValueError(
+                            f"Action tokens do not match prompt tokens for action '{actions[i]}'. "
+                            f"Expected: {expected_token_strings}, Got: {prompt_token_strings}. "
+                            "Check tokenizer compatibility or prompt structure."
+                        )
 
-                        # Proceed with scoring
-                        logprobs_i = logprobs[i, -n:]  # shape: [n, vocab_size]
-                        if logprobs_i.shape[0] < n:
-                            raise ValueError(f"Insufficient tokens for action: {actions[i]}. Expected {n}, got {logprobs_i.shape[0]}")
-                            
+                    # Proceed with scoring
+                    logprobs_i = logprobs[i, -n:]  # shape: [n, vocab_size]
+                    if logprobs_i.shape[0] < n:
+                        raise ValueError(f"Insufficient tokens for action: {actions[i]}. Expected {n}, got {logprobs_i.shape[0]}")
+                        
 
-                        actions_tensor = torch.tensor(actions_tokens[i], device=logprobs.device)  # shape: [n]
-                        selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
-                        avg = selected.mean().cpu().item()
-                        action_scores.append(avg)
-                                
-                else:
-                    logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-                    helpful_token_id = self.target_tokens["helpful"]
-                    action_scores = [logprob[helpful_token_id].cpu().item() for logprob in logprobs]
+                    actions_tensor = torch.tensor(actions_tokens[i], device=logprobs.device)  # shape: [n]
+                    selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
+                    avg = selected.mean().cpu().item()
+                    action_scores.append(avg)
                 
             env_action_logprobs.append(action_scores)
 

@@ -8,8 +8,7 @@ class PPOConfig:
     max_length: int = 1024  # Maximum sequence length
     batch_size: int = 1
     learning_rate: float = 1e-5
-    use_action_token_scoring = True  # False for "helpful" scoring, True for action token scoring
-    
+        
     # PPO hyperparameters
     epsilon_clip: float = 0.2
     ppo_epochs: int = 4
