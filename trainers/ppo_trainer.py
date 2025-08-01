@@ -248,6 +248,7 @@ class PPOTextWorldTrainer:
         # Training metrics
         total_policy_loss = 0
         total_value_loss = 0
+        total_kl_loss = 0
         num_updates = 0
 
         accumulation_steps = self.config.accumulation_steps  # Accumulate over 4 mini-batches
