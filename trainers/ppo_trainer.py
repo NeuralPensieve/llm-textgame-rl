@@ -287,17 +287,17 @@ class PPOTextWorldTrainer:
                         
                         total_loss = (policy_loss + self.config.value_loss_coef * value_loss) / accumulation_steps
                     
-                    # Backward pass
-                    self.optimizer.zero_grad(set_to_none=True)
                     self.scaler.scale(total_loss).backward()
 
                     batch_count += 1  # Increment batch count
+                    
                     # Apply gradients after accumulation_steps or at the final batch
                     if (batch_count % accumulation_steps == 0) or (end >= len(rollout_buffer)):
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)  # Clear gradients after step
                         batch_count = 0  # Reset batch count
                     
                     # Accumulate metrics
