@@ -5,9 +5,10 @@ class PPOConfig:
     # Model settings
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
-    max_length: int = 512
-    batch_size: int = 4
+    max_length: int = 1024  # Maximum sequence length
+    batch_size: int = 1
     learning_rate: float = 1e-5
+    use_action_token_scoring = True  # False for "helpful" scoring, True for action token scoring
     
     # PPO hyperparameters
     epsilon_clip: float = 0.2
@@ -17,6 +18,7 @@ class PPOConfig:
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
+    accumulation_steps: int = 4  # Gradient accumulation steps
     
     # Training settings
     num_envs: int = 16
@@ -26,7 +28,7 @@ class PPOConfig:
     log_interval: int = 10
     
     # LoRA settings
-    lora_enabled: bool = True  # Enable LoRA
+    lora_enabled: bool = False  # Enable LoRA
     lora_rank: int = 16  # Low-rank dimension for LoRA
     lora_dropout: float = 0.1  # Dropout for LoRA layers
     

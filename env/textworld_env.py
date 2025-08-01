@@ -59,11 +59,6 @@ class TextWorldEnvironment:
         self.done = False
         self.last_score = 0
         
-        # Regenerate the game with a new random seed if mock environment
-        # if self.is_mock:
-        #     self.seed = random.randint(1, 1000000)
-        #     self.env = self._create_simple_game()
-        
         # Reset the game state
         self.game_state = self.env.reset()
         observation = self.game_state.feedback
@@ -142,7 +137,7 @@ class TextWorldEnvironment:
         return description
     
     def _clean_text(self, text: str) -> str:
-        """Remove ASCII art, banners, and ANSI codes."""
+        """Remove ASCII art, banners, and ANSI codes. Normalize spaces and newlines."""
         if not text:
             return text
 
@@ -164,6 +159,12 @@ class TextWorldEnvironment:
         # Remove trailing inventory prompt clutter
         cleaned = "\n".join(clean_lines)
         cleaned = re.sub(r'>\s*-=\s*\w+\s*=-.*$', '', cleaned, flags=re.MULTILINE)
+
+        # Normalize spaces: replace 3+ consecutive spaces with single space
+        cleaned = re.sub(r' {3,}', ' ', cleaned)
+        
+        # Normalize newlines: replace 2+ consecutive newlines with single newline
+        cleaned = re.sub(r'\n{2,}', '\n', cleaned)
 
         return cleaned.strip()
     

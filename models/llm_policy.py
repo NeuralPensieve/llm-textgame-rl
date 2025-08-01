@@ -10,7 +10,7 @@ from config import PPOConfig
 
 
 class LLMPolicy(nn.Module):
-    """Improved LLM-based policy for TextWorld with better action evaluation"""
+    """Improved LLM-based policy for TextWorld with dual action evaluation methods"""
     
     def __init__(self, config: PPOConfig):
         super().__init__()
@@ -43,11 +43,11 @@ class LLMPolicy(nn.Module):
         # Move value head to model device
         self.value_head = self.value_head.to(self.model.device)
         
-        # Cache target token IDs for efficient scoring
+        # Always cache target tokens, as 'high' is needed for value scoring
         self._cache_target_tokens()
     
     def _cache_target_tokens(self):
-        """Cache target token IDs for efficient scoring"""
+        """Cache target token IDs for 'helpful' and 'high' scoring"""
         self.target_tokens = {}
         
         # Action evaluation token
@@ -55,16 +55,14 @@ class LLMPolicy(nn.Module):
         if helpful_token_id:
             self.target_tokens["helpful"] = helpful_token_id[-1]
         else:
-            self.logger.warning("Could not tokenize 'helpful'")
-            self.target_tokens["helpful"] = self.tokenizer.unk_token_id
+            raise ValueError("Could not tokenize 'helpful'")
         
         # Value evaluation token
         high_token_id = self.tokenizer.encode(" high", add_special_tokens=False)
         if high_token_id:
             self.target_tokens["high"] = high_token_id[-1]
         else:
-            self.logger.warning("Could not tokenize 'high'")
-            self.target_tokens["high"] = self.tokenizer.unk_token_id
+            raise ValueError("Could not tokenize 'high'")
         
         self.logger.info(f"Cached target tokens: {self.target_tokens}")
     
@@ -91,19 +89,20 @@ class LLMPolicy(nn.Module):
         return outputs.logits, value
     
     def create_prompts(self, states: List[str], action_lists: List[List[str]]):
-        """Create prompts for action evaluation"""
+        """Create prompts for action evaluation based on scoring method"""
         action_prompts = []
         value_prompts = []
         metadata = []
         
         for i, (state, actions) in enumerate(zip(states, action_lists)):
-            # Single action evaluation per action
             for action in actions:
-                prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                if self.config.use_action_token_scoring:
+                    prompt = f"In game state: {state}, best action is {action}"
+                else:
+                    prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
                 action_prompts.append(prompt)
-                metadata.append((i, action))
+                metadata.append((i, action.strip()))
             
-            # Single value prompt per state
             value_prompt = f"Game state:\n{state}\n\nThe value of this state is high"
             value_prompts.append(value_prompt)
         
@@ -122,15 +121,59 @@ class LLMPolicy(nn.Module):
             return_attention_mask=True
         )
     
-    def compute_action_scores(self, logprobs: torch.Tensor, metadata: List[Tuple], num_states: int) -> List[List[torch.Tensor]]:
-        """Compute action scores using 'helpful' token probability"""
+    def compute_action_scores(self, logits: torch.Tensor, input_ids: torch.Tensor, metadata: List[Tuple], num_states: int, action_prompts: List[str]) -> List[List[torch.Tensor]]:
+        """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
         
-        helpful_token_id = self.target_tokens["helpful"]
+        if self.config.use_action_token_scoring:
+            logprobs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+            
+            for idx, ((env_idx, action), prompt) in enumerate(zip(metadata, action_prompts)):
+                if not action.strip():
+                    raise ValueError(f"Empty or whitespace action for env_idx {env_idx}: {action}")
+                    
+                
+                # Tokenize action with leading space for BPE-based tokenizers
+                action_clean = action.strip()
+                action_tokens = self.tokenizer.encode(' ' + action_clean, add_special_tokens=False)
+                
+                n = len(action_tokens)
+                prompt_tokens = input_ids[idx][-n:].cpu().tolist()
+                
+                # Validate token alignment
+                if prompt_tokens != action_tokens:
+                    prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
+                    action_token_strings = self.tokenizer.convert_ids_to_tokens(action_tokens)
+                    raise ValueError(
+                        f"Token mismatch for action '{action_clean}' (env_idx {env_idx}). "
+                        f"Expected tokens: {action_tokens} ({action_token_strings}), "
+                        f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
+                    )
+                
+                # Compute score
+                logprobs_i = logprobs[idx, -n:]  # shape: [n, vocab_size]
+                if logprobs_i.shape[0] < n:
+                    raise ValueError(f"Insufficient tokens for action: {action_clean}. Expected {n}, got {logprobs_i.shape[0]}")
+                
+                actions_tensor = torch.tensor(action_tokens, device=logits.device)  # shape: [n]
+                selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
+                score = selected.mean()  # Keep as tensor
+                env_action_logprobs[env_idx].append(score)
+        else:
+            logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
+            helpful_token_id = self.target_tokens["helpful"]
+            for (env_idx, action), logprob_dist in zip(metadata, logprobs):
+                if not action.strip():
+                    self.logger.warning(f"Empty or whitespace action for env_idx {env_idx}: {action}")
+                    env_action_logprobs[env_idx].append(torch.tensor(-10.0, device=logits.device))
+                    continue
+                score = logprob_dist[helpful_token_id]
+                env_action_logprobs[env_idx].append(score)
         
-        for (env_idx, action), logprob_dist in zip(metadata, logprobs):
-            score = logprob_dist[helpful_token_id]
-            env_action_logprobs[env_idx].append(score)
+        # Ensure non-empty lists
+        for env_idx in range(num_states):
+            if not env_action_logprobs[env_idx]:
+                raise ValueError(f"No action scores computed for env_idx {env_idx}. Using fallback score.")
         
         return env_action_logprobs
     
@@ -144,64 +187,100 @@ class LLMPolicy(nn.Module):
         """Evaluate actions with gradients (for training)"""
         self.train()
         
-        # Create prompts
         action_prompts, value_prompts, metadata = self.create_prompts(states, action_lists)
-        # Tokenize
         action_inputs = self.tokenize_prompts(action_prompts)
         value_inputs = self.tokenize_prompts(value_prompts)
         
-        # Move to device
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
         value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
         
-        # Forward pass for actions
         with autocast(self.model.device.type):
             action_logits, _ = self.forward(**action_inputs)
-            action_logprobs = F.log_softmax(action_logits[:, -1, :], dim=-1)
-
-            # Forward pass for values
             value_logits, _ = self.forward(**value_inputs)
             value_logprobs = F.log_softmax(value_logits[:, -1, :], dim=-1)
         
-        # Compute scores using improved methods
-        env_action_logprobs = self.compute_action_scores(action_logprobs, metadata, len(states))
+        env_action_logprobs = self.compute_action_scores(action_logits, action_inputs['input_ids'], metadata, len(states), action_prompts)
         values = self.compute_value_scores(value_logprobs)
         
         return env_action_logprobs, values
     
     def evaluate_for_rollout(self, states: List[str], action_lists: List[List[str]]) -> Tuple[List[List[float]], List[float]]:
-        """Evaluate actions without gradients (for rollout collection) - Single criterion"""
+        """Evaluate actions without gradients (for rollout collection)"""
         self.eval()
-        env_action_logprobs = [[] for _ in range(len(states))]
+        env_action_logprobs = []
         values_list = []
         
-        # Process each state individually to save memory
-        for i, (state, actions) in enumerate(zip(states, action_lists)):
-            # Create action prompts
-            action_prompts = []
+        for state, actions in zip(states, action_lists):
+            prompt_actions = []
             for action in actions:
-                prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
-                action_prompts.append(prompt)
+                if self.config.use_action_token_scoring:
+                    prompt = f"In game state: {state}, best action is {action}"
+                else:
+                    prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                prompt_actions.append(prompt)
             
-            if action_prompts:
-                # Tokenize and evaluate actions
-                inputs = self.tokenize_prompts(action_prompts)
-                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-                
-                with torch.no_grad(), autocast(self.model.device.type):
-                    logits, _ = self.forward(**inputs)
+            inputs = self.tokenize_prompts(prompt_actions)
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            with torch.no_grad(), autocast(self.model.device.type):
+                logits, _ = self.forward(**inputs)
+                if self.config.use_action_token_scoring:
+                    action_scores = []
+                    logprobs = F.log_softmax(logits, dim=-1)  # [action_batch, seq_len, vocab_size]
+
+                    # We add a space before each action to ensure tokenization matches
+                    actions = [f" {action}" for action in actions]
+                    actions_tokens = [self.tokenizer.encode(action, add_special_tokens=False) for action in actions]
+
+                    action_batch_size = len(actions_tokens)
+                    input_ids = inputs['input_ids']  # [batch, seq_len]
+
+                    for i in range(action_batch_size):
+                        n = len(actions_tokens[i])
+
+                        # Get last n tokens from prompt's input_ids
+                        prompt_tokens = input_ids[i][-n:].cpu().tolist()
+                        expected_tokens = actions_tokens[i]
+
+                        # Validate token alignment
+                        if prompt_tokens != expected_tokens:
+                            prompt_token_strings = self.tokenizer.convert_ids_to_tokens(prompt_tokens)
+                            expected_token_strings = self.tokenizer.convert_ids_to_tokens(expected_tokens)
+                            self.logger.error(
+                                f"Token mismatch for action '{actions[i]}'. "
+                                f"Expected tokens: {expected_tokens} ({expected_token_strings}), "
+                                f"Got prompt tokens: {prompt_tokens} ({prompt_token_strings})"
+                            )
+                            raise ValueError(
+                                f"Action tokens do not match prompt tokens for action '{actions[i]}'. "
+                                f"Expected: {expected_token_strings}, Got: {prompt_token_strings}. "
+                                "Check tokenizer compatibility or prompt structure."
+                            )
+
+                        # Proceed with scoring
+                        logprobs_i = logprobs[i, -n:]  # shape: [n, vocab_size]
+                        if logprobs_i.shape[0] < n:
+                            raise ValueError(f"Insufficient tokens for action: {actions[i]}. Expected {n}, got {logprobs_i.shape[0]}")
+                            
+
+                        actions_tensor = torch.tensor(actions_tokens[i], device=logprobs.device)  # shape: [n]
+                        selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)  # shape: [n]
+                        avg = selected.mean().cpu().item()
+                        action_scores.append(avg)
+                                
+                else:
                     logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-                    
-                    # Get scores using helpful token
                     helpful_token_id = self.target_tokens["helpful"]
                     action_scores = [logprob[helpful_token_id].cpu().item() for logprob in logprobs]
-                    env_action_logprobs[i] = action_scores
                 
-                # Clean up
-                del inputs, logits, logprobs
-                torch.cuda.empty_cache()
+            env_action_logprobs.append(action_scores)
+
+
             
-            # Evaluate value
+            
+            del inputs, logits, logprobs
+            torch.cuda.empty_cache()
+            
             value_prompt = f"Game state:\n{state}\n\nThe value of this state is high"
             value_inputs = self.tokenize_prompts([value_prompt])
             value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
@@ -209,13 +288,10 @@ class LLMPolicy(nn.Module):
             with torch.no_grad(), autocast(self.model.device.type):
                 logits, _ = self.forward(**value_inputs)
                 logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-                
-                # Get value using high token
                 high_token_id = self.target_tokens["high"]
                 value_score = logprobs[0][high_token_id].cpu().item()
                 values_list.append(value_score)
             
-            # Clean up
             del value_inputs, logits, logprobs
             torch.cuda.empty_cache()
         
@@ -225,13 +301,11 @@ class LLMPolicy(nn.Module):
         """Compute KL divergence loss to prevent catastrophic forgetting"""
         with autocast(self.model.device.type):
             old_probs = F.softmax(old_logits.detach(), dim=-1)
-            
             kl_loss = F.kl_div(
                 F.log_softmax(new_logits, dim=-1),
                 old_probs,
                 reduction='batchmean'
             )
-        
         return kl_loss
     
     def generate_response(self, prompt: str, max_new_tokens: int = 50) -> str:

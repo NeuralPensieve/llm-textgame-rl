@@ -232,25 +232,23 @@ class PPOTextWorldTrainer:
         advantages = torch.FloatTensor(advantages).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
         old_logprobs = torch.FloatTensor([exp['old_logprob'] for exp in rollout_buffer]).to(self.device)
-
-        # Store old logits for KL regularization
-        old_logits_list = []
         
         # Training metrics
         total_policy_loss = 0
         total_value_loss = 0
-        total_kl_loss = 0
         num_updates = 0
+
+        accumulation_steps = self.config.accumulation_steps  # Accumulate over 4 mini-batches
+        effective_batch_size = min(self.config.batch_size, len(rollout_buffer))
         
         # PPO epochs
         for epoch in range(self.config.ppo_epochs):
             # Shuffle data
             indices = torch.randperm(len(rollout_buffer))
             
-            # Mini-batch updates
-            batch_size = min(self.config.batch_size, len(rollout_buffer))
-            for start in range(0, len(rollout_buffer), batch_size):
-                end = start + batch_size
+            batch_count = 0  # Track mini-batches for accumulation
+            for start in range(0, len(rollout_buffer), effective_batch_size):
+                end = start + effective_batch_size
                 batch_indices = indices[start:end]
                 
                 # Get batch data
@@ -275,8 +273,10 @@ class PPOTextWorldTrainer:
                             current_action_logprobs[i][action_idx] 
                             for i, action_idx in enumerate(batch_action_indices)
                         ])
-                        
-                        current_values = current_values.squeeze()
+
+                        # Ensure shapes match
+                        current_values = current_values.view(-1)  # Shape: [batch_size]
+                        batch_returns = batch_returns.view(-1)  # Shape: [batch_size]
                         
                         # Compute losses
                         ratio = torch.exp(current_logprobs - batch_old_logprobs)
@@ -284,30 +284,30 @@ class PPOTextWorldTrainer:
                         surr2 = torch.clamp(ratio, 1 - self.config.epsilon_clip, 1 + self.config.epsilon_clip) * batch_advantages
                         policy_loss = -torch.min(surr1, surr2).mean()
                         value_loss = F.mse_loss(current_values, batch_returns)
-
-                        # Add KL regularization (if we have old logits stored)
-                        kl_loss = torch.tensor(0.0, device=self.device)
-                        if epoch == 0 and old_logits_list:
-                            l2_reg = sum(p.pow(2.0).sum() for p in self.policy.value_head.parameters())
-                            kl_loss = 0.001 * l2_reg
                         
-                        total_loss = (policy_loss + 
-                                    self.config.value_loss_coef * value_loss + 
-                                    0.01 * kl_loss)
+                        total_loss = (policy_loss + self.config.value_loss_coef * value_loss) / accumulation_steps
                     
                     # Backward pass
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     self.scaler.scale(total_loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+
+                    batch_count += 1  # Increment batch count
+                    # Apply gradients after accumulation_steps or at the final batch
+                    if (batch_count % accumulation_steps == 0) or (end >= len(rollout_buffer)):
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        batch_count = 0  # Reset batch count
                     
                     # Accumulate metrics
                     total_policy_loss += policy_loss.item()
                     total_value_loss += value_loss.item()
-                    total_kl_loss += kl_loss.item()
                     num_updates += 1
+
+                    # Clear tensors to free memory
+                    del current_logprobs, current_values, ratio, surr1, surr2, policy_loss, value_loss, total_loss
+                    torch.cuda.empty_cache()
                     
                 except Exception as e:
                     self.logger.error(f"Error in PPO update: {e}")
@@ -325,16 +325,15 @@ class PPOTextWorldTrainer:
             wandb.log({
                 "policy_loss": total_policy_loss / num_updates,
                 "value_loss": total_value_loss / num_updates,
-                "kl_loss": total_kl_loss / num_updates,
                 "epsilon": self.epsilon,
                 "learning_rate": current_lr,
             })
             
             self.logger.info(f"Policy Loss: {total_policy_loss/num_updates:.4f}, "
                             f"Value Loss: {total_value_loss/num_updates:.4f}, "
-                            f"KL Loss: {total_kl_loss/num_updates:.4f}, "
                             f"LR: {current_lr:.2e}, "
-                            f"Epsilon: {self.epsilon:.4f}")
+                            f"Epsilon: {self.epsilon:.4f}, "
+                            f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}")
             
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -373,7 +372,8 @@ class PPOTextWorldTrainer:
                 self.logger.info(f"Iteration {iteration}: Avg Reward: {avg_reward:.4f}, "
                             f"Avg Episode Length: {avg_episode_length:.2f}, "
                             f"Avg Episode Reward: {avg_episode_reward:.4f}, "
-                            f"Total Episode Reward: {total_episode_reward:.4f}")
+                            f"Total Episode Reward: {total_episode_reward:.4f}, "
+                            f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}")
             
             
             # Save checkpoint
