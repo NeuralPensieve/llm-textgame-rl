@@ -108,7 +108,7 @@ class LLMPolicy(nn.Module):
         
         return action_prompts, value_prompts, metadata
     
-    def tokenize_prompts(self, prompts: List[str]):
+    def tokenize_prompts_basic(self, prompts: List[str]):
         """Tokenize prompts efficiently with caching"""
         self.tokenizer.padding_side = "left"
 
@@ -120,6 +120,43 @@ class LLMPolicy(nn.Module):
             max_length=self.config.max_length,
             return_attention_mask=True
         )
+
+    def tokenize_prompts(self, prompts: List[str]):
+        """Tokenize prompts efficiently with caching and middle truncation, if needed"""
+        self.tokenizer.padding_side = "left"
+        max_len = self.config.max_length
+        half_len = max_len // 2
+        
+        # Tokenize all prompts without truncation first
+        tokenized = self.tokenizer(
+            prompts,
+            add_special_tokens=True,
+            return_tensors="pt",
+            padding=True,  # Explicitly pad to longest sequence
+            truncation=False
+        )
+        input_ids = tokenized['input_ids']
+        
+        # Apply middle truncation only if the longest sequence exceeds max_len
+        if input_ids.size(1) > max_len:
+            input_ids = torch.cat([
+                input_ids[:, :half_len],
+                input_ids[:, -(max_len - half_len):]
+            ], dim=1)
+        
+        # Pad/truncate to exactly max_length if needed
+        padded = self.tokenizer.pad(
+            {'input_ids': input_ids},
+            padding=True,
+            max_length=max_len,
+            return_attention_mask=True,
+            return_tensors="pt"
+        )
+        
+        return {
+            'input_ids': padded['input_ids'],
+            'attention_mask': padded['attention_mask']
+        }
     
     def compute_action_scores(self, logits: torch.Tensor, input_ids: torch.Tensor, metadata: List[Tuple], num_states: int, action_prompts: List[str]) -> List[List[torch.Tensor]]:
         """Compute action scores based on scoring method"""
