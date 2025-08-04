@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from typing import List, Tuple
 import logging
 from torch.amp import autocast
@@ -146,7 +146,7 @@ class LLMPolicy(nn.Module):
         # Pad/truncate to exactly max_length if needed
         padded = self.tokenizer.pad(
             {"input_ids": input_ids},
-            padding=True,
+            padding="max_length",  # Explicitly pad to max_length
             max_length=max_len,
             return_attention_mask=True,
             return_tensors="pt",
