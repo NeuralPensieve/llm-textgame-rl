@@ -18,6 +18,7 @@ class PPOUpdater:
         self.scaler = scaler
         self.device = device
         self.logger = logger
+        self.cumulative_episodes = 0
 
     def compute_advantages(
         self, rollout_buffer: List[Dict]
@@ -83,6 +84,11 @@ class PPOUpdater:
 
     def ppo_update(self, rollout_buffer: List[Dict], iteration: int):
         """PPO policy update"""
+        # Count unique episodes in the rollout buffer
+        unique_episodes = len(
+            set((exp["env_idx"], exp["episode_id"]) for exp in rollout_buffer)
+        )
+        self.cumulative_episodes += unique_episodes
         advantages, returns = self.compute_advantages(rollout_buffer)
 
         # Convert to tensors
@@ -291,6 +297,8 @@ class PPOUpdater:
                     "value_loss": total_value_loss / num_updates,
                     "kl_loss": total_kl_loss / num_updates,
                     "learning_rate": current_lr,
+                    "cumulative_episodes": self.cumulative_episodes,
+                    "episodes_per_update": unique_episodes,
                 }
             )
 
@@ -298,7 +306,9 @@ class PPOUpdater:
                 f"Policy Loss: {total_policy_loss/num_updates:.4f}, "
                 f"Value Loss: {total_value_loss/num_updates:.4f}, "
                 f"KL Loss: {total_kl_loss/num_updates:.4f}, "
-                f"LR: {current_lr:.2e}"
+                f"LR: {current_lr:.2e}, "
+                f"Cumulative Episodes: {self.cumulative_episodes}, "
+                f"Episodes in Update: {unique_episodes}"
             )
 
         if torch.cuda.is_available():

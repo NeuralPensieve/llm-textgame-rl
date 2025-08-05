@@ -55,7 +55,7 @@ class Evaluator:
                 game_log.append(f"Step {step_count + 1}:")
                 game_log.append(f"  Available Actions: {actions}")
                 game_log.append(
-                    f"  Action Probabilities: {[f'{prob:.3f}' for prob in action_logprobs[0]]}"
+                    f"  Action Probabilities: {[f'{np.exp(prob):.3e}' for prob in action_logprobs[0]]}"
                 )
                 game_log.append(f"  Chosen Action: {chosen_action}")
                 game_log.append(f"  State Value: {value[0]:.3f}")
@@ -140,6 +140,7 @@ class Evaluator:
                 episode_lengths[i] += 1
                 episode_rewards[i] += reward
 
+                # if done or truncated
                 if done:
                     # Store completed episode
                     completed_episodes.append(
@@ -189,7 +190,7 @@ class Evaluator:
 
         # Log all games as a plain string to wandb logs instead of as a media artifact
         all_games_text = "\n\n".join(sample_games)
-        with open(f"evaluations/{wandb.run.name}.txt", "w") as f:
+        with open(f"evaluations/{wandb.run.name}.txt", "a") as f:
             f.write(f"Iteration: {iteration}\n\n")
             f.write(all_games_text)
 

@@ -24,7 +24,12 @@ class BaseTrainer(ABC):
         self.logger = logging.getLogger(__name__)
 
         run_name = datetime.datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
-        wandb.init(project="textworld-llm-ppo", name=run_name, config=vars(self.config))
+        wandb.init(
+            project="textworld-llm-ppo",
+            name=run_name,
+            config=vars(self.config),
+            settings=wandb.Settings(code_dir="../"),
+        )
 
         # Create a folder, if doesn't exist, for evaluations with run_name
         os.makedirs("evaluations", exist_ok=True)

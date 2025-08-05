@@ -29,12 +29,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     os.remove(os.path.join("./games", f))
 
         # Create environments and policy
-        self.envs = [
-            TextWorldEnvironment(
-                seed=self.config.env_seed, reuse_seed=self.config.reuse_seed
-            )
-            for _ in range(config.num_envs)
-        ]
+        self.envs = [TextWorldEnvironment() for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
 
         # Disable cache for transformer models during training
@@ -62,7 +57,11 @@ class PPOTextWorldTrainer(BaseTrainer):
         self.rollout_collector = RolloutCollector(
             self.policy, self.envs, config, self.device, self.logger
         )
+        torch.cuda.empty_cache()
+
         self.evaluator = Evaluator(self.policy, config, self.device, self.logger)
+        torch.cuda.empty_cache()
+
         self.ppo_updater = PPOUpdater(
             config,
             self.policy,
@@ -72,6 +71,7 @@ class PPOTextWorldTrainer(BaseTrainer):
             self.device,
             self.logger,
         )
+        torch.cuda.empty_cache()
 
     def train(self):
         """Main training loop"""
@@ -79,6 +79,9 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         for iteration in range(self.config.num_iterations):
             self.iteration = iteration
+
+            # Start timing the iteration
+            start_time = datetime.datetime.now()
 
             # Run evaluation
             if iteration % self.config.eval_interval == 0:
@@ -114,6 +117,16 @@ class PPOTextWorldTrainer(BaseTrainer):
                 self.config.min_epsilon, self.epsilon * self.config.epsilon_decay
             )
 
+            # Calculate iteration duration and normalize by rollout size
+            end_time = datetime.datetime.now()
+            iteration_duration = (
+                end_time - start_time
+            ).total_seconds()  # Duration in seconds
+            rollout_size = (
+                len(rollout_buffer) if rollout_buffer else 1
+            )  # Avoid division by zero
+            normalized_duration = iteration_duration / rollout_size
+
             # Log iteration metrics
             wandb.log(
                 {
@@ -124,6 +137,8 @@ class PPOTextWorldTrainer(BaseTrainer):
                     "total_episode_reward": total_episode_reward,
                     "total_experiences": len(rollout_buffer),
                     "epsilon": self.epsilon,
+                    "iteration_duration": iteration_duration,
+                    "normalized_iteration_duration": normalized_duration,
                 }
             )
 

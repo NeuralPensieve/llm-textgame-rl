@@ -5,31 +5,36 @@ import os
 
 
 class TextWorldEnvironment:
-    """Wrapper for TextWorld environment, always using mock games"""
+    """Wrapper for TextWorld environment"""
 
-    def __init__(self, seed: int = None, reuse_seed: bool = False):
+    def __init__(self, game_file: str = None, seed: int = None):
         self.max_steps = 50
         self.current_step = 0
         self.done = False
         self.last_score = 0
         self.game_state = None
-        self.reuse_seed = reuse_seed
-        self.seed = seed if seed is not None else 42
-        self.game_file_path = f"./games/simple_game_{self.seed}.z8"
+        self.seed = seed if seed is not None else random.randint(1, 1000000)
 
-        # Create or reuse a simple TextWorld game
-        self.env = self._create_or_load_simple_game()
+        if game_file:
+            # Initialize with a real TextWorld game file (e.g., zork1.z5)
+            request_infos = textworld.EnvInfos(admissible_commands=True, inventory=True)
+            self.env = textworld.start(game_file, request_infos=request_infos)
+        else:
+            # Create a simple TextWorld game if no game file is provided
+            self.env = self._create_simple_game()
 
-    def _create_or_load_simple_game(self):
-        """Create or load a simple TextWorld game with the specified seed"""
-        random.seed(self.seed)  # Ensure deterministic random choices
+    def _create_simple_game(self):
+        """Create a simple TextWorld game with a unique seed for testing"""
         options = textworld.GameOptions()
         options.seeds = self.seed
+        # options.nb_rooms = random.randint(3, 6)  # Random number of rooms (3 to 6)
+        # options.nb_objects = random.randint(3, 6)  # Random number of objects (3 to 6)
         options.nb_rooms = 4
         options.nb_objects = 4
-        options.nb_quest_items = 2
+        options.nb_quest_items = 2  # At least one quest item
         options.theme = "house"
-        options.path = self.game_file_path
+        # Use a unique file path based on the seed
+        options.path = f"./games/simple_game_{self.seed}.z8"
 
         # Randomly select quest items (1 to 3 items to collect)
         possible_items = ["key", "book", "coin", "lamp", "apple", "knife"]
@@ -37,18 +42,14 @@ class TextWorldEnvironment:
         quest_items = random.sample(possible_items, num_quest_items)
         options.quests = [{"goal": "collect", "items": quest_items}]
 
-        # Create the games directory if it doesn't exist
-        os.makedirs(os.path.dirname(self.game_file_path), exist_ok=True)
+        # Remove existing game file to prevent conflicts
+        if os.path.exists(options.path):
+            os.remove(options.path)
 
-        # Only create a new game if the file doesn't exist or reuse_seed is False
-        if not os.path.exists(self.game_file_path) or not self.reuse_seed:
-            if os.path.exists(self.game_file_path):
-                os.remove(self.game_file_path)
-            game_file, _ = textworld.make(options)
-        else:
-            game_file = self.game_file_path
-
+        game_file, _ = textworld.make(options)
         request_infos = textworld.EnvInfos(admissible_commands=True, inventory=True)
+
+        # Use TextWorld directly
         env = textworld.start(game_file, request_infos=request_infos)
         return env
 
@@ -57,10 +58,6 @@ class TextWorldEnvironment:
         self.current_step = 0
         self.done = False
         self.last_score = 0
-
-        # Recreate or reload the game with the existing seed
-        if not self.reuse_seed:
-            self.env = self._create_or_load_simple_game()
 
         # Reset the game state
         self.game_state = self.env.reset()

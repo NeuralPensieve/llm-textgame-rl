@@ -12,8 +12,8 @@ class PPOConfig:
 
     # Environment
     num_envs: int = 16
-    reuse_seed: bool = True
-    env_seed: int = 42
+    reuse_seed: bool = False
+    env_seed: int = 142
 
     # PPO hyperparameters
     epsilon_clip: float = 0.2
