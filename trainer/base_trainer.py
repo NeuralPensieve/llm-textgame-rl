@@ -6,6 +6,8 @@ import wandb
 from abc import ABC, abstractmethod
 from typing import Any
 
+logging.basicConfig(level=logging.DEBUG)
+
 
 class BaseTrainer(ABC):
     """Abstract base class for all trainers"""

@@ -7,17 +7,18 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
     max_length: int = 1024  # Maximum sequence length
-    batch_size: int = 1
-    learning_rate: float = 1e-5
+    
 
     # Environment
     num_envs: int = 16
     reuse_seed: bool = False
     env_seed: int = 142
-    difficulty: str = 'trivial'  # "trivial", "easy", "medium", "hard"
-    num_steps: int = 8  # Steps per rollout. 8 for trivial, and 16 for easy
+    difficulty: str = 'medium'  # "easy", "medium", "hard"
+    num_steps: int = 16  # Steps per rollout. 8 for trivial, and 16 for easy
 
     # PPO hyperparameters
+    batch_size: int = 1
+    learning_rate: float = 1e-5
     epsilon_clip: float = 0.2
     ppo_epochs: int = 4
     gamma: float = 0.99

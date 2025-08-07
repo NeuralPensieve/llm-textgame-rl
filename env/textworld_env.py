@@ -31,27 +31,23 @@ class TextWorldEnvironment:
         options.seeds = self.seed
         
         # Configure difficulty settings
-        if self.difficulty == "trivial":
+        if self.difficulty == "easy":
             # Original logic - goal attainable with one action
             options.nb_rooms = 2
             options.nb_objects = 4
             # Don't set quest_length to allow single-action solutions
-        elif self.difficulty == "easy":
+        elif self.difficulty == "medium":
             options.nb_rooms = 3
             options.nb_objects = 4
             options.quest_length = 3  # Minimum steps to complete
-        elif self.difficulty == "medium":
-            options.nb_rooms = 6
-            options.nb_objects = 6
-            options.quest_length = 5
         elif self.difficulty == "hard":
-            options.nb_rooms = 10
-            options.nb_objects = 8
-            options.quest_length = 7
-        else:  # default to medium
             options.nb_rooms = 6
             options.nb_objects = 6
             options.quest_length = 5
+        else:  # default to medium
+            options.nb_rooms = 3
+            options.nb_objects = 4
+            options.quest_length = 3
             
         options.theme = "house"
         options.path = f"./games/game_{self.difficulty}_{self.seed}.z8"

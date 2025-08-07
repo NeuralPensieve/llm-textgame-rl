@@ -109,7 +109,7 @@ class PPOUpdater:
         # Training metrics
         total_policy_loss = 0
         total_value_loss = 0
-        total_kl_loss = 0
+        # total_kl_loss = 0
         num_updates = 0
 
         accumulation_steps = self.config.accumulation_steps
@@ -164,35 +164,35 @@ class PPOUpdater:
                     )
 
                     # Compute new logits for KL loss
-                    action_prompts = [
-                        f"In game state: {state}, best action is {action}"
-                        for state, action in zip(
-                            batch_states, [exp["action"] for exp in batch_experiences]
-                        )
-                    ]
-                    action_inputs = self.policy.tokenize_prompts(action_prompts)
-                    action_inputs = {
-                        k: v.to(self.device) for k, v in action_inputs.items()
-                    }
-                    new_logits, _ = self.policy(**action_inputs)
+                    # action_prompts = [
+                    #     f"In game state: {state}, best action is {action}"
+                    #     for state, action in zip(
+                    #         batch_states, [exp["action"] for exp in batch_experiences]
+                    #     )
+                    # ]
+                    # action_inputs = self.policy.tokenize_prompts(action_prompts)
+                    # action_inputs = {
+                    #     k: v.to(self.device) for k, v in action_inputs.items()
+                    # }
+                    # new_logits, _ = self.policy(**action_inputs)
 
-                    # Get old logits from rollout buffer
-                    old_logits = torch.stack(
-                        [exp["old_logits"].to(self.device) for exp in batch_experiences]
-                    )
+                    # # Get old logits from rollout buffer
+                    # old_logits = torch.stack(
+                    #     [exp["old_logits"].to(self.device) for exp in batch_experiences]
+                    # )
 
-                    # Check for non-finite logits
-                    if not (
-                        new_logits.isfinite().all() and old_logits.isfinite().all()
-                    ):
-                        self.logger.warning(
-                            "Non-finite values in logits. Skipping batch."
-                        )
-                        wandb.log({"warning": "Non-finite logits"})
-                        continue
+                    # # Check for non-finite logits
+                    # if not (
+                    #     new_logits.isfinite().all() and old_logits.isfinite().all()
+                    # ):
+                    #     self.logger.warning(
+                    #         "Non-finite values in logits. Skipping batch."
+                    #     )
+                    #     wandb.log({"warning": "Non-finite logits"})
+                    #     continue
 
-                    # Compute KL loss
-                    kl_loss = self.policy.get_kl_loss(new_logits, old_logits)
+                    # # Compute KL loss
+                    # kl_loss = self.policy.get_kl_loss(new_logits, old_logits)
 
                     # Ensure shapes match
                     current_values = current_values.view(-1)
@@ -220,7 +220,7 @@ class PPOUpdater:
                     if not (
                         policy_loss.isfinite()
                         and value_loss.isfinite()
-                        and kl_loss.isfinite()
+                        # and kl_loss.isfinite()
                     ):
                         self.logger.warning("Non-finite loss values. Skipping batch.")
                         wandb.log({"warning": "Non-finite loss values"})
@@ -229,7 +229,7 @@ class PPOUpdater:
                     total_loss = (
                         policy_loss
                         + self.config.value_loss_coef * value_loss
-                        + self.config.kl_loss_coef * kl_loss
+                        # + self.config.kl_loss_coef * kl_loss
                     ) / accumulation_steps
 
                 self.scaler.scale(total_loss).backward()
@@ -267,7 +267,7 @@ class PPOUpdater:
                 # Accumulate metrics
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
-                total_kl_loss += kl_loss.item()
+                # total_kl_loss += kl_loss.item()
                 num_updates += 1
 
                 # Clear tensors to free memory
@@ -295,7 +295,7 @@ class PPOUpdater:
                     "iteration": iteration,
                     "policy_loss": total_policy_loss / num_updates,
                     "value_loss": total_value_loss / num_updates,
-                    "kl_loss": total_kl_loss / num_updates,
+                    # "kl_loss": total_kl_loss / num_updates,
                     "learning_rate": current_lr,
                     "cumulative_episodes": self.cumulative_episodes,
                     "episodes_per_update": unique_episodes,
@@ -305,7 +305,7 @@ class PPOUpdater:
             self.logger.info(
                 f"Policy Loss: {total_policy_loss/num_updates:.4f}, "
                 f"Value Loss: {total_value_loss/num_updates:.4f}, "
-                f"KL Loss: {total_kl_loss/num_updates:.4f}, "
+                # f"KL Loss: {total_kl_loss/num_updates:.4f}, "
                 f"LR: {current_lr:.2e}, "
                 f"Cumulative Episodes: {self.cumulative_episodes}, "
                 f"Episodes in Update: {unique_episodes}"
