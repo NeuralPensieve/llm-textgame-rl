@@ -5,6 +5,7 @@ import wandb
 from typing import List, Dict, Tuple
 from collections import defaultdict
 from torch.amp import autocast
+from tqdm import tqdm
 
 
 class PPOUpdater:
@@ -116,8 +117,7 @@ class PPOUpdater:
         effective_batch_size = min(self.config.batch_size, len(rollout_buffer))
 
         # PPO epochs
-        ppo_step = 0
-        for epoch in range(self.config.ppo_epochs):
+        for epoch in tqdm(range(self.config.ppo_epochs), desc="Running PPO"):
             indices = torch.randperm(len(rollout_buffer))
 
             batch_count = 0
@@ -164,6 +164,7 @@ class PPOUpdater:
                     )
 
                     # Compute new logits for KL loss
+                    # TODO: It needs to be fixed for helpful_token case, if it is to be used again
                     # action_prompts = [
                     #     f"In game state: {state}, best action is {action}"
                     #     for state, action in zip(
@@ -309,6 +310,7 @@ class PPOUpdater:
                 f"LR: {current_lr:.2e}, "
                 f"Cumulative Episodes: {self.cumulative_episodes}, "
                 f"Episodes in Update: {unique_episodes}"
+                f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}"
             )
 
         if torch.cuda.is_available():

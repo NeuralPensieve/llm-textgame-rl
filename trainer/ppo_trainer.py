@@ -148,6 +148,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     f"Avg Episode Length: {avg_episode_length:.2f}, "
                     f"Avg Episode Reward: {avg_episode_reward:.4f}, "
                     f"Total Episode Reward: {total_episode_reward:.4f}, "
+                    f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}"
                     f"Epsilon: {self.epsilon:.4f}"
                 )
 

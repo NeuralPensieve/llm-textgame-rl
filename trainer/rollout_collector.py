@@ -34,26 +34,14 @@ class RolloutCollector:
 
         self.logger.info(f"Collecting rollouts for {self.config.num_steps} steps...")
         
-        # Monitor memory usage
-        initial_memory = self._get_memory_usage()
-        self.logger.info(f"Initial memory usage: {initial_memory:.2f} MB")
 
         for step in tqdm(range(self.config.num_steps), desc="Collecting"):
-            # Memory monitoring
-            if step % 10 == 0:  # Check every 10 steps
-                current_memory = self._get_memory_usage()
-                if current_memory > initial_memory * 2:  # Memory doubled
-                    self.logger.warning(f"Memory usage high: {current_memory:.2f} MB at step {step}")
-                    self._force_cleanup()
-
             # Get valid actions for all environments
             batch_states = []
             batch_actions = []
 
             for i, (env, state) in enumerate(zip(self.envs, states)):
                 actions = env.get_valid_actions()
-                if not actions:
-                    actions = ["look", "inventory", "help"]  # Fallback actions
                 
                 batch_states.append(state)
                 batch_actions.append(actions)
@@ -92,7 +80,7 @@ class RolloutCollector:
                 truncated = done or is_last_step
 
                 # Store experience
-                experience = {
+                rollout_buffer.append({
                     "env_idx": i,
                     "episode_id": episode_ids[i],
                     "state": state,
@@ -104,11 +92,13 @@ class RolloutCollector:
                     "reward": reward,
                     "done": done,
                     "truncated": truncated,
-                }
-                step_experiences.append(experience)
+                })
 
                 # Collect action prompt for batch processing
-                action_prompt = f"In game state: {state}, best action is {chosen_action}"
+                if self.config.use_action_token_scoring:
+                    action_prompt = f"In game state: {state}, best action is {chosen_action}"
+                else:
+                    action_prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {chosen_action} is helpful"
                 action_prompts_batch.append(action_prompt)
 
                 # Update state and episode tracking
@@ -158,15 +148,7 @@ class RolloutCollector:
                 all_episode_lengths.append(length)
                 all_episode_rewards.append(reward)
 
-        final_memory = self._get_memory_usage()
-        self.logger.info(f"Final memory usage: {final_memory:.2f} MB")
-
         return rollout_buffer, all_episode_lengths, all_episode_rewards
-
-    def _get_memory_usage(self) -> float:
-        """Get current memory usage in MB"""
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 / 1024
 
     def _force_cleanup(self):
         """Force garbage collection and GPU memory cleanup"""

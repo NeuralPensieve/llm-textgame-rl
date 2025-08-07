@@ -87,7 +87,11 @@ class LLMPolicy(nn.Module):
 
         for i, (state, actions) in enumerate(zip(states, action_lists)):
             for action in actions:
-                prompt = f"In game state: {state}, best action is {action}"
+                if self.config.use_action_token_scoring:
+                    prompt = f"In game state: {state}, best action is {action}"
+                else:
+                    # prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
+                    prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
                 action_prompts.append(prompt)
                 metadata.append((i, action.strip()))
 
@@ -154,24 +158,35 @@ class LLMPolicy(nn.Module):
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
 
-        logprobs = F.log_softmax(logits, dim=-1)
+        if self.config.use_action_token_scoring:
+            logprobs = F.log_softmax(logits, dim=-1)
 
-        for idx, ((env_idx, action), prompt) in enumerate(
-            zip(metadata, action_prompts)
-        ):
-            action_tokens = self.tokenizer.encode(
-                " " + action.strip(), add_special_tokens=False
-            )
-            n = len(action_tokens)
-            prompt_tokens = input_ids[idx][-n:].cpu().tolist()
+            for idx, ((env_idx, action), prompt) in enumerate(
+                zip(metadata, action_prompts)
+            ):
+                action_tokens = self.tokenizer.encode(
+                    " " + action.strip(), add_special_tokens=False
+                )
+                n = len(action_tokens)
+                prompt_tokens = input_ids[idx][-n:].cpu().tolist()
 
-            if prompt_tokens != action_tokens:
-                raise ValueError(f"Token mismatch for action '{action.strip()}'")
+                if prompt_tokens != action_tokens:
+                    raise ValueError(f"Token mismatch for action '{action.strip()}'")
 
-            logprobs_i = logprobs[idx, -n:]
-            actions_tensor = torch.tensor(action_tokens, device=logits.device)
-            selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-            env_action_logprobs[env_idx].append(selected.mean())
+                logprobs_i = logprobs[idx, -n:]
+                actions_tensor = torch.tensor(action_tokens, device=logits.device)
+                selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+                env_action_logprobs[env_idx].append(selected.mean())
+        else:
+            logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
+            helpful_token_id = self.target_tokens["helpful"]
+            for (env_idx, action), logprob_dist in zip(metadata, logprobs):
+                if not action.strip():
+                    self.logger.warning(f"Empty or whitespace action for env_idx {env_idx}: {action}")
+                    env_action_logprobs[env_idx].append(torch.tensor(-10.0, device=logits.device))
+                    continue
+                score = logprob_dist[helpful_token_id]
+                env_action_logprobs[env_idx].append(score)
 
         return env_action_logprobs
 
@@ -218,37 +233,46 @@ class LLMPolicy(nn.Module):
         env_action_logprobs, values_list = [], []
 
         for state, actions in zip(states, action_lists):
-            prompt_actions = [
-                f"In game state: {state}, best action is {action}" for action in actions
-            ]
+            prompt_actions = []
+            for action in actions:
+                if self.config.use_action_token_scoring:
+                    prompt = f"In game state: {state}, best action is {action}"
+                else:
+                    prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
+                prompt_actions.append(prompt)
+            
             inputs = self.tokenize_prompts(prompt_actions)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
             with torch.no_grad(), autocast(self.model.device.type):
                 logits, _ = self.forward(**inputs)
-                logprobs = F.log_softmax(logits, dim=-1)
+                if self.config.use_action_token_scoring:
+                    action_scores = []
+                    logprobs = F.log_softmax(logits, dim=-1)
+                    actions_tokens = [
+                        self.tokenizer.encode(f" {a}", add_special_tokens=False)
+                        for a in actions
+                    ]
+                    input_ids = inputs["input_ids"]
 
-            actions_tokens = [
-                self.tokenizer.encode(f" {a}", add_special_tokens=False)
-                for a in actions
-            ]
-            input_ids = inputs["input_ids"]
+                    for i, tokens in enumerate(actions_tokens):
+                        n = len(tokens)
+                        prompt_tokens = input_ids[i][-n:].cpu().tolist()
+                        if prompt_tokens != tokens:
+                            raise ValueError(
+                                f"Action tokens do not match for action '{actions[i]}'"
+                            )
 
-            scores = []
-            for i, tokens in enumerate(actions_tokens):
-                n = len(tokens)
-                prompt_tokens = input_ids[i][-n:].cpu().tolist()
-                if prompt_tokens != tokens:
-                    raise ValueError(
-                        f"Action tokens do not match for action '{actions[i]}'"
-                    )
+                        logprobs_i = logprobs[i, -n:]
+                        actions_tensor = torch.tensor(tokens, device=logprobs.device)
+                        selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+                        action_scores.append(selected.mean().item())
+                else:
+                    logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
+                    helpful_token_id = self.target_tokens["helpful"]
+                    action_scores = [logprob[helpful_token_id].cpu().item() for logprob in logprobs]
 
-                logprobs_i = logprobs[i, -n:]
-                actions_tensor = torch.tensor(tokens, device=logprobs.device)
-                selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-                scores.append(selected.mean().item())
-
-            env_action_logprobs.append(scores)
+            env_action_logprobs.append(action_scores)
 
             value_prompt = f"Game state:\n{state}\n\nThe value of this state is high"
             value_inputs = self.tokenize_prompts([value_prompt])
@@ -312,8 +336,8 @@ class LLMPolicy(nn.Module):
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
-            truncation=True, # Add this
-            max_length=self.config.max_length # And this
+            truncation=True,
+            max_length=self.config.max_length
         ).to(self.model.device)
 
         with torch.no_grad(), autocast(self.model.device.type):
