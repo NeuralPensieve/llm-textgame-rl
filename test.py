@@ -1,9 +1,9 @@
 import argparse
 from env import TextWorldEnvironment
 
-def play_textworld(seed: int = None):
+def play_textworld(seed: int = None, difficulty: str = "easy"):
     # Initialize the environment with the provided seed or a random one
-    env = TextWorldEnvironment(seed=seed)
+    env = TextWorldEnvironment(seed=seed, difficulty=difficulty)
     state = env.reset()
     print("*******Welcome to the TextWorld Game!*******")
     print(f"\nGame Seed: {env.seed}")
@@ -58,5 +58,6 @@ def play_textworld(seed: int = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play a simple TextWorld game.")
     parser.add_argument('--seed', type=int, default=None, help='Random seed for game generation')
+    parser.add_argument('--difficulty', type=str, default='medium', help='Difficulty level')
     args = parser.parse_args()
-    play_textworld(args.seed)
+    play_textworld(args.seed, args.difficulty)

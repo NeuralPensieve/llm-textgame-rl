@@ -25,7 +25,7 @@ class Evaluator:
 
         for game_idx in range(num_samples):
             # Create a fresh environment for this sample game
-            sample_env = TextWorldEnvironment()
+            sample_env = TextWorldEnvironment(difficulty=self.config.difficulty)
             state = sample_env.reset()
 
             game_log = []
@@ -100,7 +100,7 @@ class Evaluator:
         self.logger.info("Running evaluation...")
 
         # Create fresh environments for evaluation
-        eval_envs = [TextWorldEnvironment() for _ in range(self.config.num_envs)]
+        eval_envs = [TextWorldEnvironment(difficulty=self.config.difficulty) for _ in range(self.config.num_envs)]
         eval_states = [env.reset() for env in eval_envs]
 
         episode_lengths = [0] * len(eval_envs)

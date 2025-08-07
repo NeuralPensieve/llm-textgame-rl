@@ -14,6 +14,8 @@ class PPOConfig:
     num_envs: int = 16
     reuse_seed: bool = False
     env_seed: int = 142
+    difficulty: str = 'trivial'  # "trivial", "easy", "medium", "hard"
+    num_steps: int = 8  # Steps per rollout. 8 for trivial, and 16 for easy
 
     # PPO hyperparameters
     epsilon_clip: float = 0.2
@@ -28,7 +30,6 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # Training settings
-    num_steps: int = 8  # Steps per rollout
     num_iterations: int = 200
     save_interval: int = 50
     log_interval: int = 10

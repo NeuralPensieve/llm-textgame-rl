@@ -19,7 +19,7 @@ class PPOTextWorldTrainer(BaseTrainer):
 
     def __init__(self, config: PPOConfig):
         super().__init__(config)
-
+        
         # Clear games folder
         if not os.path.exists("./games"):
             os.makedirs("./games")
@@ -29,7 +29,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     os.remove(os.path.join("./games", f))
 
         # Create environments and policy
-        self.envs = [TextWorldEnvironment() for _ in range(config.num_envs)]
+        self.envs = [TextWorldEnvironment(difficulty=self.config.difficulty) for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
 
         # Disable cache for transformer models during training

@@ -111,41 +111,37 @@ class LLMPolicy(nn.Module):
         )
 
     def tokenize_prompts(self, prompts: List[str]):
-        """Tokenize prompts efficiently with caching and middle truncation, if needed"""
+        """Tokenize prompts efficiently with middle truncation and dynamic padding."""
         self.tokenizer.padding_side = "left"
         max_len = self.config.max_length
         half_len = max_len // 2
 
-        # Tokenize all prompts without truncation first
-        tokenized = self.tokenizer(
+        # 1. Tokenize each prompt individually without padding or truncation
+        tokenized_prompts = self.tokenizer(
             prompts,
             add_special_tokens=True,
-            return_tensors="pt",
-            padding=True,  # Explicitly pad to longest sequence
             truncation=False,
-            return_token_type_ids=False,
-        )
-        input_ids = tokenized["input_ids"]
+            padding=False,
+        )["input_ids"]
 
-        # Apply middle truncation only if the longest sequence exceeds max_len
-        if input_ids.size(1) > max_len:
-            input_ids = torch.cat(
-                [input_ids[:, :half_len], input_ids[:, -(max_len - half_len) :]], dim=1
-            )
+        # 2. Apply middle truncation only to sequences that are too long
+        truncated_ids = []
+        for ids in tokenized_prompts:
+            if len(ids) > max_len:
+                # This sequence is too long, so we truncate it to max_len
+                truncated_ids.append(ids[:half_len] + ids[-(max_len - half_len):])
+            else:
+                truncated_ids.append(ids)
 
-        # Pad/truncate to exactly max_length if needed
+        # 3. Pad all sequences to the length of the LONGEST sequence in this batch
         padded = self.tokenizer.pad(
-            {"input_ids": input_ids},
-            # padding="max_length",  # Explicitly pad to max_length
-            max_length=max_len,
+            {"input_ids": truncated_ids},
+            padding="longest",
             return_attention_mask=True,
             return_tensors="pt",
         )
 
-        return {
-            "input_ids": padded["input_ids"],
-            "attention_mask": padded["attention_mask"],
-        }
+        return padded
 
     def compute_action_scores(
         self,
@@ -312,7 +308,13 @@ class LLMPolicy(nn.Module):
         """Generate text response (for testing/debugging)"""
         self.eval()
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # Best practice: Use the direct tokenizer with truncation for this simple case.
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True, # Add this
+            max_length=self.config.max_length # And this
+        ).to(self.model.device)
 
         with torch.no_grad(), autocast(self.model.device.type):
             outputs = self.model.generate(

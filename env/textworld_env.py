@@ -5,15 +5,17 @@ import os
 
 
 class TextWorldEnvironment:
-    """Wrapper for TextWorld environment"""
+    """Wrapper for TextWorld environment with enhanced difficulty settings"""
 
-    def __init__(self, game_file: str = None, seed: int = None):
+    def __init__(self, game_file: str = None, seed: int = None, step_penalty: float = 0.1, difficulty: str = "easy"):
         self.max_steps = 50
         self.current_step = 0
         self.done = False
         self.last_score = 0
         self.game_state = None
+        self.step_penalty = step_penalty
         self.seed = seed if seed is not None else random.randint(1, 1000000)
+        self.difficulty = difficulty
 
         if game_file:
             # Initialize with a real TextWorld game file (e.g., zork1.z5)
@@ -24,34 +26,61 @@ class TextWorldEnvironment:
             self.env = self._create_simple_game()
 
     def _create_simple_game(self):
-        """Create a simple TextWorld game with a unique seed for testing"""
+        """Create a TextWorld game with configurable difficulty"""
         options = textworld.GameOptions()
         options.seeds = self.seed
-        # options.nb_rooms = random.randint(3, 6)  # Random number of rooms (3 to 6)
-        # options.nb_objects = random.randint(3, 6)  # Random number of objects (3 to 6)
-        options.nb_rooms = 4
-        options.nb_objects = 4
-        options.nb_quest_items = 2  # At least one quest item
+        
+        # Configure difficulty settings
+        if self.difficulty == "trivial":
+            # Original logic - goal attainable with one action
+            options.nb_rooms = 2
+            options.nb_objects = 4
+            # Don't set quest_length to allow single-action solutions
+        elif self.difficulty == "easy":
+            options.nb_rooms = 3
+            options.nb_objects = 4
+            options.quest_length = 3  # Minimum steps to complete
+        elif self.difficulty == "medium":
+            options.nb_rooms = 6
+            options.nb_objects = 6
+            options.quest_length = 5
+        elif self.difficulty == "hard":
+            options.nb_rooms = 10
+            options.nb_objects = 8
+            options.quest_length = 7
+        else:  # default to medium
+            options.nb_rooms = 6
+            options.nb_objects = 6
+            options.quest_length = 5
+            
         options.theme = "house"
-        # Use a unique file path based on the seed
-        options.path = f"./games/simple_game_{self.seed}.z8"
-
-        # Randomly select quest items (1 to 3 items to collect)
-        possible_items = ["key", "book", "coin", "lamp", "apple", "knife"]
-        num_quest_items = random.randint(1, 3)
-        quest_items = random.sample(possible_items, num_quest_items)
-        options.quests = [{"goal": "collect", "items": quest_items}]
+        options.path = f"./games/game_{self.difficulty}_{self.seed}.z8"
 
         # Remove existing game file to prevent conflicts
         if os.path.exists(options.path):
             os.remove(options.path)
 
+        # Create the game - quest_length is the key parameter for complexity
         game_file, _ = textworld.make(options)
-        request_infos = textworld.EnvInfos(admissible_commands=True, inventory=True)
+            
+        request_infos = textworld.EnvInfos(
+            admissible_commands=True, 
+            inventory=True,
+            description=True,
+            score=True,
+            won=True,
+            lost=True
+        )
 
-        # Use TextWorld directly
         env = textworld.start(game_file, request_infos=request_infos)
         return env
+
+    def set_difficulty(self, difficulty: str):
+        """Change difficulty and recreate the game"""
+        self.difficulty = difficulty
+        if hasattr(self.env, 'close'):
+            self.env.close()
+        self.env = self._create_simple_game()
 
     def reset(self):
         """Reset environment and return initial state"""
@@ -81,7 +110,7 @@ class TextWorldEnvironment:
         state = self._extract_state(observation, self.game_state)
 
         # Add step penalty to encourage efficiency
-        reward = reward - 0.01
+        reward = reward - self.step_penalty
 
         # Check if max steps reached
         if self.current_step >= self.max_steps:
@@ -106,6 +135,7 @@ class TextWorldEnvironment:
                 "admissible_commands": admissible_commands,
                 "won": self.game_state.won,
                 "lost": self.game_state.lost,
+                "steps_taken": self.current_step,
             },
         )
 
@@ -118,21 +148,7 @@ class TextWorldEnvironment:
                 if hasattr(self.game_state, "__getitem__"):
                     return self.game_state.get("admissible_commands", [])
         except:
-            pass
-
-        # Fallback valid actions
-        return [
-            "look",
-            "inventory",
-            "north",
-            "south",
-            "east",
-            "west",
-            "take all",
-            "drop all",
-            "examine room",
-            "wait",
-        ]
+            raise ValueError("No admissible commands found")
 
     def _extract_state(self, observation, game_state):
         """Extract state description from game state"""
@@ -181,6 +197,17 @@ class TextWorldEnvironment:
         cleaned = re.sub(r"\n{2,}", "\n", cleaned)
 
         return cleaned.strip()
+
+    def get_game_stats(self):
+        """Get current game statistics"""
+        return {
+            "difficulty": self.difficulty,
+            "current_step": self.current_step,
+            "max_steps": self.max_steps,
+            "score": self.last_score,
+            "done": self.done,
+            "seed": self.seed
+        }
 
     def close(self):
         """Close the environment"""
