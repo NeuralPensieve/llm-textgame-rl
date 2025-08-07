@@ -283,7 +283,7 @@ class PPOUpdater:
                     total_loss,
                     logprob_diff,
                 )
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
 
         # Update learning rate
         self.scheduler.step()
@@ -310,7 +310,7 @@ class PPOUpdater:
                 f"LR: {current_lr:.2e}, "
                 f"Cumulative Episodes: {self.cumulative_episodes}, "
                 f"Episodes in Update: {unique_episodes}"
-                f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}"
+                f"Scoring: {'action_tokens' if self.config.scoring_method else 'helpful_token'}"
             )
 
         if torch.cuda.is_available():

@@ -57,10 +57,10 @@ class PPOTextWorldTrainer(BaseTrainer):
         self.rollout_collector = RolloutCollector(
             self.policy, self.envs, config, self.device, self.logger
         )
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         self.evaluator = Evaluator(self.policy, config, self.device, self.logger)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         self.ppo_updater = PPOUpdater(
             config,
@@ -71,7 +71,7 @@ class PPOTextWorldTrainer(BaseTrainer):
             self.device,
             self.logger,
         )
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
     def train(self):
         """Main training loop"""
@@ -148,7 +148,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     f"Avg Episode Length: {avg_episode_length:.2f}, "
                     f"Avg Episode Reward: {avg_episode_reward:.4f}, "
                     f"Total Episode Reward: {total_episode_reward:.4f}, "
-                    f"Scoring: {'action_tokens' if self.config.use_action_token_scoring else 'helpful_token'}"
+                    f"Scoring: {self.config.scoring_method}"
                     f"Epsilon: {self.epsilon:.4f}"
                 )
 

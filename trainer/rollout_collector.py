@@ -4,8 +4,6 @@ import random
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from torch.amp import autocast
-import psutil
-import gc
 
 
 class RolloutCollector:
@@ -34,15 +32,13 @@ class RolloutCollector:
 
         self.logger.info(f"Collecting rollouts for {self.config.num_steps} steps...")
         
-
         for step in tqdm(range(self.config.num_steps), desc="Collecting"):
             # Get valid actions for all environments
             batch_states = []
             batch_actions = []
 
-            for i, (env, state) in enumerate(zip(self.envs, states)):
+            for env, state in zip(self.envs, states):
                 actions = env.get_valid_actions()
-                
                 batch_states.append(state)
                 batch_actions.append(actions)
 
@@ -54,8 +50,6 @@ class RolloutCollector:
 
             # Step each environment
             new_states = []
-            step_experiences = []
-            action_prompts_batch = []
             
             for i, (env, state, actions, logprobs, value) in enumerate(
                 zip(self.envs, states, batch_actions, action_logprobs, values)
@@ -68,7 +62,7 @@ class RolloutCollector:
 
                 chosen_action = actions[action_idx]
                 
-                # Take step
+                # Take step in environment
                 next_state, reward, done, info = env.step(chosen_action)
 
                 # Update episode tracking
@@ -94,15 +88,9 @@ class RolloutCollector:
                     "truncated": truncated,
                 })
 
-                # Collect action prompt for batch processing
-                if self.config.use_action_token_scoring:
-                    action_prompt = f"In game state: {state}, best action is {chosen_action}"
-                else:
-                    action_prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {chosen_action} is helpful"
-                action_prompts_batch.append(action_prompt)
-
-                # Update state and episode tracking
+                # Update state for next step
                 if not done:
+                    # Accumulate state history
                     updated_state = (
                         state + "\n\n" + 
                         f"action taken: {chosen_action}\n\n" + 
@@ -110,51 +98,24 @@ class RolloutCollector:
                     )
                     new_states.append(updated_state)
                 else:
-                    # Store completed episode metrics
+                    # Episode ended, store metrics and reset
                     all_episode_lengths.append(episode_lengths[i])
                     all_episode_rewards.append(episode_rewards[i])
-                    # Reset episode tracking
                     episode_lengths[i] = 0
                     episode_rewards[i] = 0.0
                     episode_ids[i] += 1
                     new_states.append(env.reset())
             
-            # Process action prompts in batch
-            if step_experiences and action_prompts_batch:
-                with torch.no_grad(), autocast(self.device.type):
-                    action_inputs = self.policy.tokenize_prompts(action_prompts_batch)
-                    action_inputs = {k: v.to(self.device) for k, v in action_inputs.items()}
-                    batch_logits, _ = self.policy(**action_inputs)
-
-                    # Store experiences without old_logits to avoid memory leak
-                    for i, (experience, logits) in enumerate(
-                        zip(step_experiences, batch_logits)
-                    ):
-                        # OLD LOGIC (causes memory leak):
-                        # experience["old_logits"] = logits.cpu().detach().half()
-                        # del logits
-                        rollout_buffer.append(experience)
-
-                # Clean up GPU memory
-                del action_inputs, batch_logits
-                torch.cuda.empty_cache()
-                gc.collect()
-
+            # Update states for next iteration
             states = new_states
 
-        # Store metrics for truncated episodes
+        # Store metrics for any incomplete episodes
         for i, (length, reward) in enumerate(zip(episode_lengths, episode_rewards)):
             if length > 0:
                 all_episode_lengths.append(length)
                 all_episode_rewards.append(reward)
 
         return rollout_buffer, all_episode_lengths, all_episode_rewards
-
-    def _force_cleanup(self):
-        """Force garbage collection and GPU memory cleanup"""
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
     def update_epsilon(self, new_epsilon: float):
         """Update epsilon for epsilon-greedy exploration"""

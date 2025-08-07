@@ -7,7 +7,7 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
     max_length: int = 1024  # Maximum sequence length
-    use_action_token_scoring = False  # False for "helpful" scoring, True for action token scoring
+    scoring_method: str = "helpful"  # Options: "helpful" or "action_token"
     
 
     # Environment

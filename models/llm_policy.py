@@ -7,12 +7,14 @@ import logging
 from torch.amp import autocast
 
 from config import PPOConfig
+from config import PromptManager
 
 
 class LLMPolicy(nn.Module):
     def __init__(self, config: PPOConfig):
         super().__init__()
         self.config = config
+        self.prompt_manager = PromptManager(config.scoring_method)
         self.logger = logging.getLogger(__name__)
 
         # Load pretrained model and tokenizer
@@ -45,7 +47,7 @@ class LLMPolicy(nn.Module):
         self._cache_target_tokens()
 
     def _cache_target_tokens(self):
-        """Cache target token IDs for 'helpful' and 'high' scoring"""
+        """Cache target token IDs for 'helpful' scoring"""
         self.target_tokens = {}
 
         # Action evaluation token
@@ -54,13 +56,6 @@ class LLMPolicy(nn.Module):
             self.target_tokens["helpful"] = helpful_token_id[-1]
         else:
             raise ValueError("Could not tokenize 'helpful'")
-
-        # Value evaluation token
-        high_token_id = self.tokenizer.encode(" high", add_special_tokens=False)
-        if high_token_id:
-            self.target_tokens["high"] = high_token_id[-1]
-        else:
-            raise ValueError("Could not tokenize 'high'")
 
         self.logger.info(f"Cached target tokens: {self.target_tokens}")
 
@@ -80,26 +75,6 @@ class LLMPolicy(nn.Module):
             value = self.value_head(last_hidden)
 
         return outputs.logits, value
-
-    def create_prompts(self, states: List[str], action_lists: List[List[str]]):
-        """Create prompts for action evaluation based on scoring method"""
-        action_prompts, value_prompts, metadata = [], [], []
-
-        for i, (state, actions) in enumerate(zip(states, action_lists)):
-            for action in actions:
-                if self.config.use_action_token_scoring:
-                    prompt = f"In game state: {state}, best action is {action}"
-                else:
-                    # prompt = f"In this text adventure:\n{state}\n\nConsidering action: {action}\nThis action is helpful"
-                    prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
-                action_prompts.append(prompt)
-                metadata.append((i, action.strip()))
-
-            value_prompts.append(
-                f"Game state:\n{state}\n\nThe value of this state is high"
-            )
-
-        return action_prompts, value_prompts, metadata
 
     def tokenize_prompts_basic(self, prompts: List[str]):
         """Tokenize prompts efficiently with caching"""
@@ -158,7 +133,7 @@ class LLMPolicy(nn.Module):
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
 
-        if self.config.use_action_token_scoring:
+        if self.prompt_manager.scoring_method == "action_token":
             logprobs = F.log_softmax(logits, dim=-1)
 
             for idx, ((env_idx, action), prompt) in enumerate(
@@ -181,39 +156,33 @@ class LLMPolicy(nn.Module):
             logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
             helpful_token_id = self.target_tokens["helpful"]
             for (env_idx, action), logprob_dist in zip(metadata, logprobs):
-                if not action.strip():
-                    self.logger.warning(f"Empty or whitespace action for env_idx {env_idx}: {action}")
-                    env_action_logprobs[env_idx].append(torch.tensor(-10.0, device=logits.device))
-                    continue
                 score = logprob_dist[helpful_token_id]
                 env_action_logprobs[env_idx].append(score)
 
         return env_action_logprobs
-
-    def compute_value_scores(self, logprobs: torch.Tensor) -> torch.Tensor:
-        """Compute value scores using 'high' token probability"""
-        return logprobs[:, self.target_tokens["high"]]
 
     def evaluate_actions(
         self, states: List[str], action_lists: List[List[str]]
     ) -> Tuple[List[List[torch.Tensor]], torch.Tensor]:
         """Evaluate actions with gradients (for training)"""
         self.train()
-
-        action_prompts, value_prompts, metadata = self.create_prompts(
-            states, action_lists
-        )
+        
+        # Build action prompts
+        action_prompts = []
+        metadata = []
+        for i, (state, actions) in enumerate(zip(states, action_lists)):
+            for action in actions:
+                prompt = self.prompt_manager.get_action_prompt(state, actions, action)
+                action_prompts.append(prompt)
+                metadata.append((i, action.strip()))
+        
+        # Get action scores
         action_inputs = self.tokenize_prompts(action_prompts)
-        value_inputs = self.tokenize_prompts(value_prompts)
-
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
-        value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
-
+        
         with autocast(self.model.device.type):
             action_logits, _ = self.forward(**action_inputs)
-            value_logits, _ = self.forward(**value_inputs)
-            value_logprobs = F.log_softmax(value_logits[:, -1, :], dim=-1)
-
+        
         env_action_logprobs = self.compute_action_scores(
             action_logits,
             action_inputs["input_ids"],
@@ -221,32 +190,37 @@ class LLMPolicy(nn.Module):
             len(states),
             action_prompts,
         )
-        values = self.compute_value_scores(value_logprobs)
-
-        return env_action_logprobs, values
+        
+        # Get state values - SIMPLIFIED!
+        state_inputs = self.tokenize_prompts(states)  # Just tokenize states directly
+        state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
+        
+        with autocast(self.model.device.type):
+            _, values = self.forward(**state_inputs)  # Use value head output
+        
+        return env_action_logprobs, values.squeeze(-1)
 
     def evaluate_for_rollout(
         self, states: List[str], action_lists: List[List[str]]
     ) -> Tuple[List[List[float]], List[float]]:
         """Evaluate actions without gradients (for rollout collection)"""
         self.eval()
-        env_action_logprobs, values_list = [], []
+        env_action_logprobs = []
 
         for state, actions in zip(states, action_lists):
-            prompt_actions = []
-            for action in actions:
-                if self.config.use_action_token_scoring:
-                    prompt = f"In game state: {state}, best action is {action}"
-                else:
-                    prompt = f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
-                prompt_actions.append(prompt)
+            # Create action prompts
+            action_prompts = [
+                self.prompt_manager.get_action_prompt(state, actions, action)
+                for action in actions
+            ]
             
-            inputs = self.tokenize_prompts(prompt_actions)
+            # Get action scores
+            inputs = self.tokenize_prompts(action_prompts)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
             with torch.no_grad(), autocast(self.model.device.type):
                 logits, _ = self.forward(**inputs)
-                if self.config.use_action_token_scoring:
+                if self.prompt_manager.scoring_method == "action_token":
                     action_scores = []
                     logprobs = F.log_softmax(logits, dim=-1)
                     actions_tokens = [
@@ -274,14 +248,13 @@ class LLMPolicy(nn.Module):
 
             env_action_logprobs.append(action_scores)
 
-            value_prompt = f"Game state:\n{state}\n\nThe value of this state is high"
-            value_inputs = self.tokenize_prompts([value_prompt])
-            value_inputs = {k: v.to(self.model.device) for k, v in value_inputs.items()}
-
-            with torch.no_grad(), autocast(self.model.device.type):
-                logits, _ = self.forward(**value_inputs)
-                logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-                values_list.append(logprobs[0][self.target_tokens["high"]].item())
+        # Get state values - SIMPLIFIED!
+        state_inputs = self.tokenize_prompts(states)  # Just states
+        state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
+        
+        with torch.no_grad(), autocast(self.model.device.type):
+            _, values = self.forward(**state_inputs)
+            values_list = values.squeeze(-1).cpu().tolist()
 
         return env_action_logprobs, values_list
 
@@ -355,15 +328,6 @@ class LLMPolicy(nn.Module):
     def get_device(self):
         """Get model device"""
         return self.model.device
-
-    def clear_cache(self):
-        """Clear GPU cache"""
-        if self.model.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        # Clear any cached key-value pairs
-        if hasattr(self.model, "past_key_values"):
-            self.model.past_key_values = None
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates"""
