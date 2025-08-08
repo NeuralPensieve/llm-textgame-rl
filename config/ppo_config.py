@@ -27,7 +27,6 @@ class PPOConfig:
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    kl_loss_coef: float = 0.01
     accumulation_steps: int = 4  # Gradient accumulation steps
     normalize_advantage: bool = True
 

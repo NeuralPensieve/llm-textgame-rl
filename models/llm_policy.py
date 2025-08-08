@@ -258,49 +258,6 @@ class LLMPolicy(nn.Module):
 
         return env_action_logprobs, values_list
 
-    def get_kl_loss(
-        self, new_logits: torch.Tensor, old_logits: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute KL divergence loss to prevent catastrophic forgetting with shape alignment"""
-
-        # Ensure both tensors are on the same device
-        old_logits = old_logits.to(new_logits.device)
-
-        # Get sequence lengths
-        new_seq_len = new_logits.size(1)
-        old_seq_len = old_logits.size(1)
-
-        # For left-padded sequences, align by removing excess left padding
-        if new_seq_len == old_seq_len:
-            # Same length, no alignment needed
-            new_logits_aligned = new_logits
-            old_logits_aligned = old_logits
-        elif new_seq_len > old_seq_len:
-            # new_logits is longer, truncate from left (remove extra padding)
-            diff = new_seq_len - old_seq_len
-            new_logits_aligned = new_logits[:, diff:, :]  # Remove left padding
-            old_logits_aligned = old_logits
-        else:
-            # old_logits is longer, truncate from left (remove extra padding)
-            diff = old_seq_len - new_seq_len
-            old_logits_aligned = old_logits[:, diff:, :]  # Remove left padding
-            new_logits_aligned = new_logits
-
-        # Verify shapes match
-        assert (
-            new_logits_aligned.shape == old_logits_aligned.shape
-        ), f"Shape mismatch after alignment: {new_logits_aligned.shape} vs {old_logits_aligned.shape}"
-
-        with autocast(new_logits.device.type):
-            old_probs = F.softmax(old_logits_aligned.detach(), dim=-1)
-            kl_loss = F.kl_div(
-                F.log_softmax(new_logits_aligned, dim=-1),
-                old_probs,
-                reduction="batchmean",
-            )
-
-        return kl_loss
-
     def generate_response(self, prompt: str, max_new_tokens: int = 50) -> str:
         """Generate text response (for testing/debugging)"""
         self.eval()
