@@ -12,3 +12,6 @@ class PromptManager:
         else:
             # Add this to catch any unexpected values
             raise ValueError(f"Unknown scoring method: {self.scoring_method}")
+        
+    def get_value_prompt(self, state: str) -> str:
+        return f"Game state:\n{state}\n\nThe value of this state is high"
