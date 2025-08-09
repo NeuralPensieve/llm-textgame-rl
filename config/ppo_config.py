@@ -7,7 +7,7 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
     max_length: int = 1024  # Maximum sequence length
-    scoring_method: str = "helpful"  # Options: "helpful" or "action_token"
+    scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     
 
     # Environment
@@ -31,7 +31,7 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # Training settings
-    num_iterations: int = 200
+    num_iterations: int = 400
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
@@ -43,5 +43,9 @@ class PPOConfig:
 
     # Exploration
     epsilon: float = 0.5
-    epsilon_decay: float = 0.95
-    min_epsilon: float = 0.01
+    epsilon_decay: float = 0.98
+    min_epsilon: float = 0.05
+
+    # Evaluation
+    num_eval_episodes: int = 20
+    num_sample_games: int = 5

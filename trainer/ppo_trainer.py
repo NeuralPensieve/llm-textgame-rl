@@ -178,7 +178,9 @@ class PPOTextWorldTrainer(BaseTrainer):
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load training checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # Fix for PyTorch 2.6+ - set weights_only=False for trusted checkpoints
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
         self.policy.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 

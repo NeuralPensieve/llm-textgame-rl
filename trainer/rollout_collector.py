@@ -98,7 +98,7 @@ class RolloutCollector:
                     )
                     new_states.append(updated_state)
                 else:
-                    # Episode ended, store metrics and reset
+                    # Episode ended naturally - store metrics
                     all_episode_lengths.append(episode_lengths[i])
                     all_episode_rewards.append(episode_rewards[i])
                     episode_lengths[i] = 0
@@ -108,12 +108,6 @@ class RolloutCollector:
             
             # Update states for next iteration
             states = new_states
-
-        # Store metrics for any incomplete episodes
-        for i, (length, reward) in enumerate(zip(episode_lengths, episode_rewards)):
-            if length > 0:
-                all_episode_lengths.append(length)
-                all_episode_rewards.append(reward)
 
         return rollout_buffer, all_episode_lengths, all_episode_rewards
 
