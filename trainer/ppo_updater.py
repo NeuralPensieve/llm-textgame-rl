@@ -25,7 +25,6 @@ class PPOUpdater:
         self, rollout_buffer: List[Dict]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute GAE advantages and returns with episode-level diagnostics."""
-        # Group experiences by (env_idx, episode_id)
         grouped_experiences = defaultdict(list)
         for exp in rollout_buffer:
             grouped_experiences[(exp["env_idx"], exp["episode_id"])].append(exp)
@@ -37,14 +36,13 @@ class PPOUpdater:
             if not experiences:
                 continue
 
-            advantages = []
-            returns = []
-
             last_exp = experiences[-1]
             last_value = last_exp["value"] if last_exp["truncated"] else 0.0
             last_advantage = 0.0
 
-            # Compute rewards and advantages in reverse order
+            advantages_ep = []
+            returns_ep = []
+            
             for exp in reversed(experiences):
                 if exp["done"]:
                     delta = exp["reward"] - exp["value"]
@@ -57,29 +55,26 @@ class PPOUpdater:
                 advantage = (
                     delta + self.config.gamma * self.config.gae_lambda * last_advantage
                 )
-                returns.append(advantage + exp["value"])
-                advantages.append(advantage)
+                returns_ep.append(advantage + exp["value"])
+                advantages_ep.append(advantage)
 
                 last_value = exp["value"]
                 last_advantage = advantage
 
-            # Restore chronological order
-            advantages.reverse()
-            returns.reverse()
+            advantages_ep.reverse()
+            returns_ep.reverse()
 
-            all_advantages.extend(advantages)
-            all_returns.extend(returns)
+            all_advantages.extend(advantages_ep)
+            all_returns.extend(returns_ep)
 
-        # Convert to arrays
         advantages = np.array(all_advantages, dtype=np.float32)
         returns = np.array(all_returns, dtype=np.float32)
-
-        # Clip advantages to limit extreme values
-        advantages = np.clip(advantages, -5, 5)
-
-        # Normalize advantages
+        
         if len(advantages) > 1 and self.config.normalize_advantage:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Optional clipping after normalization
+        advantages = np.clip(advantages, -5, 5)
 
         return advantages, returns
 
@@ -110,6 +105,7 @@ class PPOUpdater:
         # Training metrics
         total_policy_loss = 0
         total_value_loss = 0
+        total_entropy = 0
         num_updates = 0
 
         accumulation_steps = self.config.accumulation_steps
@@ -139,39 +135,42 @@ class PPOUpdater:
 
                 # Forward pass
                 with autocast(self.device.type):
-                    current_action_logprobs, current_values = (
-                        self.policy.evaluate_actions(batch_states, batch_action_lists)
+                    current_action_logits, current_values = self.policy.evaluate_actions(
+                        batch_states, batch_action_lists
                     )
 
-                    # Check for non-finite model outputs
-                    if not (
-                        self._has_any_finite_tensor(current_action_logprobs)
-                        and current_values.isfinite().all()
-                    ):
-                        self.logger.warning(
-                            "Non-finite values in model outputs. Skipping batch."
-                        )
-                        wandb.log({"warning": "Non-finite model outputs"})
+                    batch_chosen_logprobs = []
+                    batch_entropy = []
+                    for i, logits in enumerate(current_action_logits):
+                        if logits.nelement() == 0:
+                            # Handle cases with no available actions if they can occur
+                            continue
+                        
+                        # Use log_softmax for numerical stability. This creates a true
+                        # log probability distribution over the available actions.
+                        log_probs_dist = F.log_softmax(logits, dim=-1)
+                        probs_dist = torch.exp(log_probs_dist)
+
+                        # A) Extract the log_prob of the action that was chosen
+                        action_idx = batch_action_indices[i]
+                        batch_chosen_logprobs.append(log_probs_dist[action_idx])
+
+                        # B) Compute categorical entropy: H(p) = -sum(p * log(p))
+                        entropy_dist = -torch.sum(probs_dist * log_probs_dist)
+                        batch_entropy.append(entropy_dist)
+
+                    if not batch_chosen_logprobs:
+                        self.logger.warning("Skipping batch with no valid actions.")
                         continue
 
-                    # Extract logprobs for chosen actions
-                    current_logprobs = torch.stack(
-                        [
-                            current_action_logprobs[i][action_idx]
-                            for i, action_idx in enumerate(batch_action_indices)
-                        ]
-                    )
+                    current_logprobs = torch.stack(batch_chosen_logprobs)
+                    entropy = torch.stack(batch_entropy).mean()
 
-                    # Ensure shapes match
+                    # Compute PPO loss
                     current_values = current_values.view(-1)
-                    batch_returns = batch_returns.view(-1)
-
-                    # Compute losses
-                    logprob_diff = torch.clamp(
-                        current_logprobs - batch_old_logprobs, -3, 3
-                    )
-                    ratio = torch.exp(logprob_diff)
-                    ratio = torch.clamp(ratio, 0.1, 10.0)
+                    
+                    ratio = torch.exp(current_logprobs - batch_old_logprobs)
+                    
                     surr1 = ratio * batch_advantages
                     surr2 = (
                         torch.clamp(
@@ -184,11 +183,7 @@ class PPOUpdater:
                     policy_loss = -torch.min(surr1, surr2).mean()
                     value_loss = F.mse_loss(current_values, batch_returns)
 
-                    # Check for non-finite losses
-                    if not (
-                        policy_loss.isfinite()
-                        and value_loss.isfinite()
-                    ):
+                    if not (policy_loss.isfinite() and value_loss.isfinite() and entropy.isfinite()):
                         self.logger.warning("Non-finite loss values. Skipping batch.")
                         wandb.log({"warning": "Non-finite loss values"})
                         continue
@@ -196,48 +191,30 @@ class PPOUpdater:
                     total_loss = (
                         policy_loss
                         + self.config.value_loss_coef * value_loss
+                        - self.config.entropy_coef * entropy
                     ) / accumulation_steps
 
                 self.scaler.scale(total_loss).backward()
 
-                batch_count += 1
-
-                # Apply gradients after accumulation_steps or at the final batch
-                if (batch_count % accumulation_steps == 0) or (
-                    end >= len(rollout_buffer)
-                ):
+                if ((start + effective_batch_size) // effective_batch_size) % accumulation_steps == 0 or end >= len(rollout_buffer):
                     self.scaler.unscale_(self.optimizer)
-                    # Clip gradients with relaxed non-finite handling
-                    total_norm = torch.nn.utils.clip_grad_norm_(
+                    torch.nn.utils.clip_grad_norm_(
                         self.policy.parameters(),
                         self.config.max_grad_norm,
-                        norm_type=2.0,
-                        error_if_nonfinite=False,  # Allow clipping even with non-finite norms
+                        error_if_nonfinite=False
                     )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
-                    batch_count = 0
 
-                    # Log gradient norm
-                    # wandb.log(
-                    #     {
-                    #         "gradient_norm": (
-                    #             total_norm.item()
-                    #             if total_norm.isfinite()
-                    #             else float("inf")
-                    #         )
-                    #     }
-                    # )
-
-                # Accumulate metrics
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
                 num_updates += 1
 
-                # Clear tensors to free memory
                 del (
                     current_logprobs,
+                    entropy,
                     current_values,
                     ratio,
                     surr1,
@@ -245,14 +222,10 @@ class PPOUpdater:
                     policy_loss,
                     value_loss,
                     total_loss,
-                    logprob_diff,
                 )
-                # torch.cuda.empty_cache()
 
-        # Update learning rate
         self.scheduler.step()
 
-        # Log metrics
         if num_updates > 0:
             current_lr = self.optimizer.param_groups[0]["lr"]
             wandb.log(
@@ -260,6 +233,7 @@ class PPOUpdater:
                     "iteration": iteration,
                     "policy_loss": total_policy_loss / num_updates,
                     "value_loss": total_value_loss / num_updates,
+                    "entropy": total_entropy / num_updates,
                     "learning_rate": current_lr,
                     "cumulative_episodes": self.cumulative_episodes,
                     "episodes_per_update": unique_episodes,
@@ -269,10 +243,8 @@ class PPOUpdater:
             self.logger.info(
                 f"Policy Loss: {total_policy_loss/num_updates:.4f}, "
                 f"Value Loss: {total_value_loss/num_updates:.4f}, "
-                f"LR: {current_lr:.2e}, "
-                f"Cumulative Episodes: {self.cumulative_episodes}, "
-                f"Episodes in Update: {unique_episodes}"
-                f"Scoring: {'action_tokens' if self.config.scoring_method else 'helpful_token'}"
+                f"Entropy: {total_entropy/num_updates:.4f}, "
+                f"LR: {current_lr:.2e}"
             )
 
         if torch.cuda.is_available():

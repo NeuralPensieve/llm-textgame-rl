@@ -166,6 +166,8 @@ class LLMPolicy(nn.Module):
                 score = logprob_dist[helpful_token_id]
                 env_action_logprobs[env_idx].append(score)
 
+        env_action_logprobs = torch.stack([torch.stack(row) for row in env_action_logprobs])
+
         return env_action_logprobs
     
     def compute_value_scores(self, logprobs: torch.Tensor) -> torch.Tensor:

@@ -42,9 +42,9 @@ class PPOConfig:
     lora_dropout: float = 0.1  # Dropout for LoRA layers
 
     # Exploration
-    epsilon: float = 0.5
+    epsilon: float = 0.0
     epsilon_decay: float = 0.99
-    min_epsilon: float = 0.05
+    min_epsilon: float = 0.0
 
     # Evaluation
     num_eval_episodes: int = 20
