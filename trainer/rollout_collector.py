@@ -27,6 +27,7 @@ class RolloutCollector:
         episode_ids = [0] * len(self.envs)
         episode_lengths = [0] * len(self.envs)
         episode_rewards = [0.0] * len(self.envs)
+        episode_step_counts = [0] * len(self.envs)  # Track steps per episode
         all_episode_lengths = []
         all_episode_rewards = []
 
@@ -68,6 +69,7 @@ class RolloutCollector:
                 # Update episode tracking
                 episode_lengths[i] += 1
                 episode_rewards[i] += reward
+                episode_step_counts[i] += 1
 
                 # Check if this is the last step (truncation)
                 is_last_step = step == self.config.num_steps - 1
@@ -88,23 +90,27 @@ class RolloutCollector:
                     "truncated": truncated,
                 })
 
+                # Check if episode reached natural conclusion
+                episode_naturally_concluded = done or (episode_step_counts[i] >= self.config.num_steps)
+                
                 # Update state for next step
-                if not done:
-                    # Accumulate state history
+                if episode_naturally_concluded:
+                    # Episode reached natural conclusion - store metrics and reset
+                    all_episode_lengths.append(episode_lengths[i])
+                    all_episode_rewards.append(episode_rewards[i])
+                    episode_lengths[i] = 0
+                    episode_rewards[i] = 0.0
+                    episode_step_counts[i] = 0
+                    episode_ids[i] += 1
+                    new_states.append(env.reset())
+                else:
+                    # Continue episode
                     updated_state = (
                         state + "\n\n" + 
                         f"action taken: {chosen_action}\n\n" + 
                         next_state
                     )
                     new_states.append(updated_state)
-                else:
-                    # Episode ended naturally - store metrics
-                    all_episode_lengths.append(episode_lengths[i])
-                    all_episode_rewards.append(episode_rewards[i])
-                    episode_lengths[i] = 0
-                    episode_rewards[i] = 0.0
-                    episode_ids[i] += 1
-                    new_states.append(env.reset())
             
             # Update states for next iteration
             states = new_states

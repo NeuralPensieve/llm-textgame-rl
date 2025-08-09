@@ -220,15 +220,15 @@ class PPOUpdater:
                     batch_count = 0
 
                     # Log gradient norm
-                    wandb.log(
-                        {
-                            "gradient_norm": (
-                                total_norm.item()
-                                if total_norm.isfinite()
-                                else float("inf")
-                            )
-                        }
-                    )
+                    # wandb.log(
+                    #     {
+                    #         "gradient_norm": (
+                    #             total_norm.item()
+                    #             if total_norm.isfinite()
+                    #             else float("inf")
+                    #         )
+                    #     }
+                    # )
 
                 # Accumulate metrics
                 total_policy_loss += policy_loss.item()

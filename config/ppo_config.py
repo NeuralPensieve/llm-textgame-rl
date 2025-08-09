@@ -43,7 +43,7 @@ class PPOConfig:
 
     # Exploration
     epsilon: float = 0.5
-    epsilon_decay: float = 0.98
+    epsilon_decay: float = 0.99
     min_epsilon: float = 0.05
 
     # Evaluation
