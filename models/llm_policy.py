@@ -136,7 +136,7 @@ class LLMPolicy(nn.Module):
         metadata: List[Tuple],
         num_states: int,
         action_prompts: List[str],
-    ) -> List[List[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
 
@@ -167,6 +167,8 @@ class LLMPolicy(nn.Module):
                 env_action_logprobs[env_idx].append(score)
 
         env_action_logprobs = torch.stack([torch.stack(row) for row in env_action_logprobs])
+
+        env_action_logprobs = F.log_softmax(env_action_logprobs / self.config.temperature, dim=-1)
 
         return env_action_logprobs
     
@@ -253,13 +255,16 @@ class LLMPolicy(nn.Module):
                         logprobs_i = logprobs[i, -n:]
                         actions_tensor = torch.tensor(tokens, device=logprobs.device)
                         selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-                        action_scores.append(selected.mean().item())
+                        action_scores.append(selected.mean())
                 else:
                     logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
                     helpful_token_id = self.target_tokens["helpful"]
-                    action_scores = [logprob[helpful_token_id].cpu().item() for logprob in logprobs]
+                    action_scores = [logprob[helpful_token_id] for logprob in logprobs]
 
-            env_action_logprobs.append(action_scores)
+                # Apply temperature and normalize (matching compute_action_scores)
+                action_scores_tensor = torch.stack(action_scores)
+                action_logprobs = F.log_softmax(action_scores_tensor / self.config.temperature, dim=-1)
+                env_action_logprobs.append(action_logprobs.cpu().tolist())
 
             value_prompt = self.prompt_manager.get_value_prompt(state)
             value_inputs = self.tokenize_prompts([value_prompt])

@@ -78,6 +78,8 @@ class PPOTextWorldTrainer(BaseTrainer):
         self.logger.info("Starting PPO training...")
 
         for iteration in range(self.config.num_iterations):
+            if iteration == 30:
+                print('debug')
             self.iteration = iteration
 
             # Start timing the iteration
@@ -104,10 +106,10 @@ class PPOTextWorldTrainer(BaseTrainer):
 
             # Calculate metrics
             rewards = [exp["reward"] for exp in rollout_buffer]
-            avg_reward = np.mean(rewards) if rewards else 0.0
-            avg_episode_length = np.mean(episode_lengths) if episode_lengths else 0.0
-            avg_episode_reward = np.mean(episode_rewards) if episode_rewards else 0.0
-            total_episode_reward = np.sum(episode_rewards) if episode_rewards else 0.0
+            avg_reward = np.mean(rewards)
+            avg_episode_length = np.mean(episode_lengths)
+            avg_episode_reward = np.mean(episode_rewards)
+            total_episode_reward = np.sum(episode_rewards)
 
             # Update policy
             self.ppo_updater.ppo_update(rollout_buffer, iteration)
@@ -141,16 +143,6 @@ class PPOTextWorldTrainer(BaseTrainer):
                     "normalized_iteration_duration": normalized_duration,
                 }
             )
-
-            if iteration % self.config.log_interval == 0:
-                self.logger.info(
-                    f"Iteration {iteration}: Avg Reward: {avg_reward:.4f}, "
-                    f"Avg Episode Length: {avg_episode_length:.2f}, "
-                    f"Avg Episode Reward: {avg_episode_reward:.4f}, "
-                    f"Total Episode Reward: {total_episode_reward:.4f}, "
-                    f"Scoring: {self.config.scoring_method}"
-                    f"Epsilon: {self.epsilon:.4f}"
-                )
 
             # Save checkpoint
             if (iteration + 1) % self.config.save_interval == 0 and iteration > 10:

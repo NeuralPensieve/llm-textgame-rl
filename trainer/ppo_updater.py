@@ -135,28 +135,21 @@ class PPOUpdater:
 
                 # Forward pass
                 with autocast(self.device.type):
-                    current_action_logits, current_values = self.policy.evaluate_actions(
+                    current_action_logprobs, current_values = self.policy.evaluate_actions(
                         batch_states, batch_action_lists
                     )
 
                     batch_chosen_logprobs = []
                     batch_entropy = []
-                    for i, logits in enumerate(current_action_logits):
-                        if logits.nelement() == 0:
-                            # Handle cases with no available actions if they can occur
-                            continue
-                        
-                        # Use log_softmax for numerical stability. This creates a true
-                        # log probability distribution over the available actions.
-                        log_probs_dist = F.log_softmax(logits, dim=-1)
-                        probs_dist = torch.exp(log_probs_dist)
+                    for i, logprobs in enumerate(current_action_logprobs):
+                        probs_dist = torch.exp(logprobs)
 
                         # A) Extract the log_prob of the action that was chosen
                         action_idx = batch_action_indices[i]
-                        batch_chosen_logprobs.append(log_probs_dist[action_idx])
+                        batch_chosen_logprobs.append(logprobs[action_idx])
 
                         # B) Compute categorical entropy: H(p) = -sum(p * log(p))
-                        entropy_dist = -torch.sum(probs_dist * log_probs_dist)
+                        entropy_dist = -torch.sum(probs_dist * logprobs)
                         batch_entropy.append(entropy_dist)
 
                     if not batch_chosen_logprobs:

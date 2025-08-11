@@ -29,6 +29,7 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     accumulation_steps: int = 4  # Gradient accumulation steps
     normalize_advantage: bool = True
+    temperature: float = 1.0
 
     # Training settings
     num_iterations: int = 400

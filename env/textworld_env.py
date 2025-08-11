@@ -2,6 +2,8 @@ import textworld
 import re
 import random
 import os
+import tempfile
+import shutil
 
 
 class TextWorldEnvironment:
@@ -14,8 +16,12 @@ class TextWorldEnvironment:
         self.last_score = 0
         self.game_state = None
         self.step_penalty = step_penalty
-        self.seed = seed if seed is not None else random.randint(1, 1000000)
+        self.base_seed = seed if seed is not None else random.randint(1, 1000000)
+        self.seed = self.base_seed
         self.difficulty = difficulty
+        self.game_file = game_file  # Store game file for reset
+        self.temp_dir = None  # Track temporary directory for cleanup
+        self.temp_game_file = None  # Track temporary game file
 
         if game_file:
             # Initialize with a real TextWorld game file (e.g., zork1.z5)
@@ -25,21 +31,42 @@ class TextWorldEnvironment:
             # Create a simple TextWorld game if no game file is provided
             self.env = self._create_simple_game()
 
+    def _cleanup_temp_files(self):
+        """Clean up any temporary files and directories"""
+        if self.temp_game_file and os.path.exists(self.temp_game_file):
+            try:
+                os.remove(self.temp_game_file)
+            except:
+                pass
+        
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir)
+            except:
+                pass
+        
+        self.temp_game_file = None
+        self.temp_dir = None
+
     def _create_simple_game(self):
-        """Create a TextWorld game with configurable difficulty"""
+        """Create a TextWorld game with configurable difficulty in memory"""
+        # Clean up any previous temporary files
+        self._cleanup_temp_files()
+        
+        # Generate new seed for variety
+        self.seed = random.randint(1, 1000000)
+        
         options = textworld.GameOptions()
         options.seeds = self.seed
         
         # Configure difficulty settings
         if self.difficulty == "easy":
-            # Original logic - goal attainable with one action
             options.nb_rooms = 2
             options.nb_objects = 4
-            # Don't set quest_length to allow single-action solutions
         elif self.difficulty == "medium":
             options.nb_rooms = 3
             options.nb_objects = 4
-            options.quest_length = 3  # Minimum steps to complete
+            options.quest_length = 3
         elif self.difficulty == "hard":
             options.nb_rooms = 6
             options.nb_objects = 6
@@ -50,13 +77,13 @@ class TextWorldEnvironment:
             options.quest_length = 3
             
         options.theme = "house"
-        options.path = f"./games/game_{self.difficulty}_{self.seed}.z8"
-
-        # Remove existing game file to prevent conflicts
-        if os.path.exists(options.path):
-            os.remove(options.path)
-
-        # Create the game - quest_length is the key parameter for complexity
+        
+        # Create temporary directory for this game
+        self.temp_dir = tempfile.mkdtemp(prefix="textworld_")
+        self.temp_game_file = os.path.join(self.temp_dir, f"game_{self.seed}.z8")
+        options.path = self.temp_game_file
+        
+        # Create the game
         game_file, _ = textworld.make(options)
             
         request_infos = textworld.EnvInfos(
@@ -76,15 +103,39 @@ class TextWorldEnvironment:
         self.difficulty = difficulty
         if hasattr(self.env, 'close'):
             self.env.close()
+        self._cleanup_temp_files()
         self.env = self._create_simple_game()
 
     def reset(self):
-        """Reset environment and return initial state"""
+        """Reset environment by creating a new instance and return initial state"""
         self.current_step = 0
         self.done = False
         self.last_score = 0
+        
+        # Close existing environment if it exists
+        if hasattr(self.env, 'close'):
+            self.env.close()
+        
+        # Clean up old temporary files before creating new ones
+        self._cleanup_temp_files()
+        
+        # Create a new environment instance
+        if self.game_file:
+            # Recreate from existing game file
+            request_infos = textworld.EnvInfos(
+                admissible_commands=True, 
+                inventory=True,
+                description=True,
+                score=True,
+                won=True,
+                lost=True
+            )
+            self.env = textworld.start(self.game_file, request_infos=request_infos)
+        else:
+            # Create a new simple game with new seed
+            self.env = self._create_simple_game()
 
-        # Reset the game state
+        # Reset the game state with the new environment
         self.game_state = self.env.reset()
         observation = self.game_state.feedback
 
@@ -206,6 +257,11 @@ class TextWorldEnvironment:
         }
 
     def close(self):
-        """Close the environment"""
+        """Close the environment and clean up all resources"""
         if hasattr(self.env, "close"):
             self.env.close()
+        self._cleanup_temp_files()
+    
+    def __del__(self):
+        """Destructor to ensure cleanup on object deletion"""
+        self.close()
