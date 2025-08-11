@@ -152,17 +152,16 @@ class PPOUpdater:
                         entropy_dist = -torch.sum(probs_dist * logprobs)
                         batch_entropy.append(entropy_dist)
 
-                    if not batch_chosen_logprobs:
-                        self.logger.warning("Skipping batch with no valid actions.")
-                        continue
-
                     current_logprobs = torch.stack(batch_chosen_logprobs)
                     entropy = torch.stack(batch_entropy).mean()
 
                     # Compute PPO loss
                     current_values = current_values.view(-1)
                     
-                    ratio = torch.exp(current_logprobs - batch_old_logprobs)
+                    log_prob_diff = current_logprobs - batch_old_logprobs
+                    log_prob_diff = torch.clamp(log_prob_diff, min=-3, max=3)
+
+                    ratio = torch.exp(log_prob_diff)
                     
                     surr1 = ratio * batch_advantages
                     surr2 = (

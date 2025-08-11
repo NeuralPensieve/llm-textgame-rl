@@ -78,8 +78,6 @@ class PPOTextWorldTrainer(BaseTrainer):
         self.logger.info("Starting PPO training...")
 
         for iteration in range(self.config.num_iterations):
-            if iteration == 30:
-                print('debug')
             self.iteration = iteration
 
             # Start timing the iteration

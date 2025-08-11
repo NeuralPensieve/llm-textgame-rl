@@ -7,7 +7,7 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
     max_length: int = 1024  # Maximum sequence length
-    scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
+    scoring_method: str = "helpful"  # Options: "helpful" or "action_token"
     
 
     # Environment
@@ -30,6 +30,7 @@ class PPOConfig:
     accumulation_steps: int = 4  # Gradient accumulation steps
     normalize_advantage: bool = True
     temperature: float = 1.0
+    sampling_temperature: float = 1.0
 
     # Training settings
     num_iterations: int = 400

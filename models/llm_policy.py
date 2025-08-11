@@ -159,12 +159,14 @@ class LLMPolicy(nn.Module):
                 actions_tensor = torch.tensor(action_tokens, device=logits.device)
                 selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
                 env_action_logprobs[env_idx].append(selected.mean())
-        else:
-            logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
+        elif self.prompt_manager.scoring_method == "helpful":
+            # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
             helpful_token_id = self.target_tokens["helpful"]
-            for (env_idx, action), logprob_dist in zip(metadata, logprobs):
-                score = logprob_dist[helpful_token_id]
+            for (env_idx, action), logit in zip(metadata, logits[:, -1, :]):
+                score = logit[helpful_token_id]
                 env_action_logprobs[env_idx].append(score)
+        else:
+            raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
 
         env_action_logprobs = torch.stack([torch.stack(row) for row in env_action_logprobs])
 
@@ -256,10 +258,13 @@ class LLMPolicy(nn.Module):
                         actions_tensor = torch.tensor(tokens, device=logprobs.device)
                         selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
                         action_scores.append(selected.mean())
-                else:
-                    logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
+                elif self.prompt_manager.scoring_method == "helpful":
+                    # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
                     helpful_token_id = self.target_tokens["helpful"]
-                    action_scores = [logprob[helpful_token_id] for logprob in logprobs]
+                    action_scores = [logit[helpful_token_id] for logit in logits[:, -1, :]]
+                else:
+                    raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
+
 
                 # Apply temperature and normalize (matching compute_action_scores)
                 action_scores_tensor = torch.stack(action_scores)

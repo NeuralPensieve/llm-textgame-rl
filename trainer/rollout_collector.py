@@ -27,7 +27,7 @@ class RolloutCollector:
         episode_ids = [0] * len(self.envs)
         episode_lengths = [0] * len(self.envs)
         episode_rewards = [0.0] * len(self.envs)
-        episode_step_counts = [0] * len(self.envs)  # Track steps per episode
+        episode_step_counts = [0] * len(self.envs)
         all_episode_lengths = []
         all_episode_rewards = []
 
@@ -55,11 +55,14 @@ class RolloutCollector:
             for i, (env, state, actions, logprobs, value) in enumerate(
                 zip(self.envs, states, batch_actions, action_logprobs, values)
             ):
-                # Select action (epsilon-greedy)
-                if random.random() < self.epsilon:
-                    action_idx = random.randint(0, len(actions) - 1)
-                else:
-                    action_idx = np.argmax(logprobs)
+                # # Select action (epsilon-greedy)
+                # if random.random() < self.epsilon:
+                #     action_idx = random.randint(0, len(actions) - 1)
+                # else:
+                #     action_idx = np.argmax(logprobs)
+
+                action_idx = self.temperature_sampling_with_floor(np.array(logprobs), min_prob=0.05)
+                
 
                 chosen_action = actions[action_idx]
                 
@@ -91,10 +94,11 @@ class RolloutCollector:
                 })
 
                 # Check if episode reached natural conclusion
-                episode_naturally_concluded = done or (episode_step_counts[i] >= self.config.num_steps)
+                # TODO: Fix end of step issue
+                episode_concluded = done or (episode_step_counts[i] >= self.config.num_steps)
                 
                 # Update state for next step
-                if episode_naturally_concluded:
+                if episode_concluded:
                     # Episode reached natural conclusion - store metrics and reset
                     all_episode_lengths.append(episode_lengths[i])
                     all_episode_rewards.append(episode_rewards[i])
@@ -120,3 +124,20 @@ class RolloutCollector:
     def update_epsilon(self, new_epsilon: float):
         """Update epsilon for epsilon-greedy exploration"""
         self.epsilon = new_epsilon
+
+    def temperature_sampling_with_floor(self, logprobs, min_prob=0.05):
+        """Apply temperature and ensure minimum probability for all actions"""
+        # Apply temperature
+        adjusted_logprobs = np.array(logprobs) / self.config.sampling_temperature
+        
+        # Convert to probabilities (stable softmax)
+        adjusted_logprobs = adjusted_logprobs - np.max(adjusted_logprobs)
+        probs = np.exp(adjusted_logprobs)
+        probs = probs / probs.sum()
+        
+        # Apply probability floor and renormalize
+        probs = np.maximum(probs, min_prob)
+        probs = probs / probs.sum()
+        
+        action_idx = np.random.choice(len(probs), p=probs)
+        return action_idx
