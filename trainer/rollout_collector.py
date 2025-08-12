@@ -55,13 +55,13 @@ class RolloutCollector:
             for i, (env, state, actions, logprobs, value) in enumerate(
                 zip(self.envs, states, batch_actions, action_logprobs, values)
             ):
-                # # Select action (epsilon-greedy)
-                # if random.random() < self.epsilon:
-                #     action_idx = random.randint(0, len(actions) - 1)
-                # else:
-                #     action_idx = np.argmax(logprobs)
+                # Select action (epsilon-greedy)
+                if random.random() < self.epsilon:
+                    action_idx = random.randint(0, len(actions) - 1)
+                else:
+                    action_idx = np.argmax(logprobs)
 
-                action_idx = self.temperature_sampling_with_floor(np.array(logprobs), min_prob=0.05)
+                # action_idx = self.temperature_sampling_with_floor(np.array(logprobs), min_prob=0.05)
                 
 
                 chosen_action = actions[action_idx]

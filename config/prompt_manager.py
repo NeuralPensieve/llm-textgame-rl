@@ -6,12 +6,13 @@ class PromptManager:
         
     def get_action_prompt(self, state: str, actions: List[str], action: str) -> str:
         if self.scoring_method == "helpful":
-            return f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
+            # return f"{state}\nConsidering available actions: {', '.join(actions)}\nThis action {action} is helpful"
+            return f"{state}\nAction {action} is helpful"
         elif self.scoring_method == "action_token":
-            return f"In game state: {state}, best action is {action}"
+            return f"{state}\nBest action is {action}"
         else:
             # Add this to catch any unexpected values
             raise ValueError(f"Unknown scoring method: {self.scoring_method}")
         
     def get_value_prompt(self, state: str) -> str:
-        return f"Game state:\n{state}\n\nThe value of this state is high"
+        return f"{state}\n\nThe value of this state is high"

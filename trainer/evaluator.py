@@ -97,7 +97,7 @@ class Evaluator:
 
     def run_evaluation(self, iteration: int) -> Tuple[float, float]:
         """Run evaluation rollouts with deterministic policy (no epsilon-greedy)"""
-        self.logger.info("Running evaluation...")
+        self.logger.info("\n\nRunning evaluation...")
         
         # Run episodes for both evaluation metrics and sample game logging
         num_eval_episodes = 20  # Episodes for metrics

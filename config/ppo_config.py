@@ -27,10 +27,8 @@ class PPOConfig:
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    accumulation_steps: int = 4  # Gradient accumulation steps
+    accumulation_steps: int = 8  # Gradient accumulation steps
     normalize_advantage: bool = True
-    temperature: float = 1.0
-    sampling_temperature: float = 1.0
 
     # Training settings
     num_iterations: int = 400
@@ -44,9 +42,11 @@ class PPOConfig:
     lora_dropout: float = 0.1  # Dropout for LoRA layers
 
     # Exploration
-    epsilon: float = 0.0
-    epsilon_decay: float = 0.99
-    min_epsilon: float = 0.0
+    epsilon: float = 0.5
+    epsilon_decay: float = 0.95
+    min_epsilon: float = 0.05
+    temperature: float = 1.0
+    sampling_temperature: float = 1.0
 
     # Evaluation
     num_eval_episodes: int = 20
