@@ -116,12 +116,12 @@ class LLMPolicy(nn.Module):
         metadata: List[Tuple],
         num_states: int,
         action_prompts: List[str],
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
 
         if self.prompt_manager.scoring_method == "action_token":
-            logprobs = F.log_softmax(logits, dim=-1)
+            # logprobs = F.log_softmax(logits, dim=-1)
 
             for idx, ((env_idx, action), prompt) in enumerate(
                 zip(metadata, action_prompts)
@@ -135,7 +135,7 @@ class LLMPolicy(nn.Module):
                 if prompt_tokens != action_tokens:
                     raise ValueError(f"Token mismatch for action '{action.strip()}'")
 
-                logprobs_i = logprobs[idx, -n:]
+                logprobs_i = logits[idx, -n:]
                 actions_tensor = torch.tensor(action_tokens, device=logits.device)
                 selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
                 env_action_logprobs[env_idx].append(selected.mean())
@@ -148,9 +148,7 @@ class LLMPolicy(nn.Module):
         else:
             raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
 
-        env_action_logprobs = torch.stack([torch.stack(row) for row in env_action_logprobs])
-
-        env_action_logprobs = F.log_softmax(env_action_logprobs / self.config.temperature, dim=-1)
+        env_action_logprobs = [F.log_softmax(torch.stack(row) / self.config.temperature, dim=-1) for row in env_action_logprobs]
 
         return env_action_logprobs
 
@@ -184,7 +182,6 @@ class LLMPolicy(nn.Module):
             action_prompts,
         )
 
-        # Get state values - SIMPLIFIED!
         state_inputs = self.tokenize_prompts(states)  # Just tokenize states directly
         state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
         
@@ -216,7 +213,7 @@ class LLMPolicy(nn.Module):
                 logits, _ = self.forward(**inputs)
                 if self.prompt_manager.scoring_method == "action_token":
                     action_scores = []
-                    logprobs = F.log_softmax(logits, dim=-1)
+                    # logprobs = F.log_softmax(logits, dim=-1)
                     actions_tokens = [
                         self.tokenizer.encode(f" {a}", add_special_tokens=False)
                         for a in actions
@@ -231,8 +228,8 @@ class LLMPolicy(nn.Module):
                                 f"Action tokens do not match for action '{actions[i]}'"
                             )
 
-                        logprobs_i = logprobs[i, -n:]
-                        actions_tensor = torch.tensor(tokens, device=logprobs.device)
+                        logprobs_i = logits[i, -n:]
+                        actions_tensor = torch.tensor(tokens, device=logits.device)
                         selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
                         action_scores.append(selected.mean())
                 elif self.prompt_manager.scoring_method == "helpful":
@@ -248,7 +245,6 @@ class LLMPolicy(nn.Module):
                 action_logprobs = F.log_softmax(action_scores_tensor / self.config.temperature, dim=-1)
                 env_action_logprobs.append(action_logprobs.cpu().tolist())
 
-        # Get state values - SIMPLIFIED!
         state_inputs = self.tokenize_prompts(states)  # Just states
         state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
         
@@ -261,6 +257,6 @@ class LLMPolicy(nn.Module):
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates"""
         return [
-            {"params": self.model.parameters(), "lr": 1e-5, "name": "pretrained"},
-            {"params": self.value_head.parameters(), "lr": 3e-4, "name": "value_head"},
+            {"params": self.model.parameters(), "lr": self.config.learning_rate, "name": "pretrained"},
+            {"params": self.value_head.parameters(), "lr": self.config.learning_rate_value_head, "name": "value_head"},
         ]

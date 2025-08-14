@@ -6,8 +6,9 @@ class PPOConfig:
     # Model settings
     # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
     model_name: str = "openai-community/gpt2"
-    max_length: int = 1024  # Maximum sequence length
-    scoring_method: str = "helpful"  # Options: "helpful" or "action_token"
+    max_length: int = 512  # Maximum sequence length
+    scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
+    dynamic_config: bool = False
     
 
     # Environment
@@ -16,22 +17,24 @@ class PPOConfig:
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
     num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
+    repeatable: bool = True
 
     # PPO hyperparameters
-    batch_size: int = 1
+    batch_size: int = 4
+    accumulation_steps: int = 16
     learning_rate: float = 1e-5
+    learning_rate_value_head: float = 1e-4
     epsilon_clip: float = 0.2
     ppo_epochs: int = 4
-    gamma: float = 0.99
+    gamma: float = 0.9
     gae_lambda: float = 0.95
-    value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01
+    value_loss_coef: float = 2.0
+    entropy_coef: float = 0.001
     max_grad_norm: float = 0.5
-    accumulation_steps: int = 8  # Gradient accumulation steps
     normalize_advantage: bool = True
 
     # Training settings
-    num_iterations: int = 400
+    num_iterations: int = 200
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
@@ -42,11 +45,12 @@ class PPOConfig:
     lora_dropout: float = 0.1  # Dropout for LoRA layers
 
     # Exploration
-    epsilon: float = 0.5
+    epsilon: float = 0.0
     epsilon_decay: float = 0.95
-    min_epsilon: float = 0.05
+    min_epsilon: float = 0.0
     temperature: float = 1.0
     sampling_temperature: float = 1.0
+    softmax_floor: float = 0.05
 
     # Evaluation
     num_eval_episodes: int = 20

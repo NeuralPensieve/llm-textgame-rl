@@ -56,12 +56,12 @@ class RolloutCollector:
                 zip(self.envs, states, batch_actions, action_logprobs, values)
             ):
                 # Select action (epsilon-greedy)
-                if random.random() < self.epsilon:
-                    action_idx = random.randint(0, len(actions) - 1)
-                else:
-                    action_idx = np.argmax(logprobs)
+                # if random.random() < self.epsilon:
+                #     action_idx = random.randint(0, len(actions) - 1)
+                # else:
+                #     action_idx = np.argmax(logprobs)
 
-                # action_idx = self.temperature_sampling_with_floor(np.array(logprobs), min_prob=0.05)
+                action_idx, old_logprob_indexed = self.temperature_sampling_with_floor(np.array(logprobs))
                 
 
                 chosen_action = actions[action_idx]
@@ -86,7 +86,7 @@ class RolloutCollector:
                     "action": chosen_action,
                     "action_idx": action_idx,
                     "available_actions": actions,
-                    "old_logprob": logprobs[action_idx],
+                    "old_logprob": old_logprob_indexed,
                     "value": value,
                     "reward": reward,
                     "done": done,
@@ -124,20 +124,23 @@ class RolloutCollector:
     def update_epsilon(self, new_epsilon: float):
         """Update epsilon for epsilon-greedy exploration"""
         self.epsilon = new_epsilon
-
-    def temperature_sampling_with_floor(self, logprobs, min_prob=0.05):
-        """Apply temperature and ensure minimum probability for all actions"""
+    
+    def temperature_sampling_with_floor(self, logprobs):
+        # Convert from log-probs to probs
+        probs = np.exp(logprobs)
+        
         # Apply temperature
-        adjusted_logprobs = np.array(logprobs) / self.config.sampling_temperature
-        
-        # Convert to probabilities (stable softmax)
-        adjusted_logprobs = adjusted_logprobs - np.max(adjusted_logprobs)
-        probs = np.exp(adjusted_logprobs)
-        probs = probs / probs.sum()
-        
-        # Apply probability floor and renormalize
-        probs = np.maximum(probs, min_prob)
-        probs = probs / probs.sum()
-        
+        probs = probs ** (1 / self.config.sampling_temperature)
+        probs /= probs.sum()
+
+        # Apply hard floor to every action's probability
+        probs = np.maximum(probs, self.config.softmax_floor)
+        probs /= probs.sum()
+
+        # Sample action
         action_idx = np.random.choice(len(probs), p=probs)
-        return action_idx
+
+        # Get the log-prob from the modified distribution
+        old_logprob = np.log(probs[action_idx] + 1e-8)
+
+        return action_idx, old_logprob

@@ -19,7 +19,7 @@ class Evaluator:
 
     def _run_single_episode(self, episode_idx: int, log_details: bool = False) -> Dict:
         """Run a single episode and return results with optional detailed logging"""
-        env = TextWorldEnvironment(difficulty=self.config.difficulty)
+        env = TextWorldEnvironment(difficulty=self.config.difficulty, repeatable=self.config.repeatable)
         state = env.reset()
         
         game_log = []

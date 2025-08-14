@@ -9,7 +9,7 @@ import shutil
 class TextWorldEnvironment:
     """Wrapper for TextWorld environment with enhanced difficulty settings"""
 
-    def __init__(self, game_file: str = None, seed: int = None, step_penalty: float = 0.1, difficulty: str = "easy"):
+    def __init__(self, game_file: str = None, seed: int = None, step_penalty: float = 0.1, difficulty: str = "easy", gamma=0.9, repeatable=False):
         self.max_steps = 50
         self.current_step = 0
         self.done = False
@@ -22,6 +22,8 @@ class TextWorldEnvironment:
         self.game_file = game_file  # Store game file for reset
         self.temp_dir = None  # Track temporary directory for cleanup
         self.temp_game_file = None  # Track temporary game file
+        self.repeatable = repeatable
+        self.gamma = gamma
 
         if game_file:
             # Initialize with a real TextWorld game file (e.g., zork1.z5)
@@ -111,6 +113,13 @@ class TextWorldEnvironment:
         self.current_step = 0
         self.done = False
         self.last_score = 0
+
+        # If repeatable is True, just reset the existing environment
+        if self.repeatable and hasattr(self, 'env') and self.env is not None:
+            # Just reset the existing environment without recreating it
+            self.game_state = self.env.reset()
+            observation = self.game_state.feedback
+            return self._extract_state(observation, self.game_state)
         
         # Close existing environment if it exists
         if hasattr(self.env, 'close'):
@@ -201,6 +210,9 @@ class TextWorldEnvironment:
         """Extract state description from game state"""
         if observation is None:
             raise ValueError("Invalid game state: No observation provided.")
+        
+        if self.repeatable:
+            return game_state["objective"]
 
         description = self._clean_text(observation)
 

@@ -29,7 +29,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     os.remove(os.path.join("./games", f))
 
         # Create environments and policy
-        self.envs = [TextWorldEnvironment(difficulty=self.config.difficulty) for _ in range(config.num_envs)]
+        self.envs = [TextWorldEnvironment(difficulty=self.config.difficulty, repeatable=self.config.repeatable) for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
 
         # Disable cache for transformer models during training
@@ -42,7 +42,7 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         # Add learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config.num_iterations, eta_min=1e-6
+            self.optimizer, T_max=config.num_iterations, eta_min=1e-7
         )
 
         # Initialize GradScaler for FP16 training

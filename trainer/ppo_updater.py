@@ -84,8 +84,8 @@ class PPOUpdater:
         advantages = np.array(all_advantages, dtype=np.float32)
         returns = np.array(all_returns, dtype=np.float32)
         
-        # if len(advantages) > 1 and self.config.normalize_advantage:
-        #     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if len(advantages) > 1 and self.config.normalize_advantage:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         advantages = np.clip(advantages, -5, 5)
 
@@ -95,20 +95,21 @@ class PPOUpdater:
         """PPO policy update"""
         self.logger.info(f"\nIteration: {iteration}")
 
-        changes = self.dynamic_config.check_and_update() if iteration > 0 else None
+        if self.config.dynamic_config:
+            changes = self.dynamic_config.check_and_update() if iteration > 0 else None
 
-        if changes:
-            self.logger.info(f"DYNAMIC CONFIG UPDATED at iteration {iteration}")
-            
-            for param, (old_val, new_val) in changes.items():
-                # Log to terminal for ALL parameters
-                self.logger.info(f"  {param}: {old_val} → {new_val}")
+            if changes:
+                self.logger.info(f"DYNAMIC CONFIG UPDATED at iteration {iteration}")
+                
+                for param, (old_val, new_val) in changes.items():
+                    # Log to terminal for ALL parameters
+                    self.logger.info(f"  {param}: {old_val} → {new_val}")
 
-                # Special handling for learning rate changes
-                if param == 'learning_rate':
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = new_val
-                    self.logger.info(f"  Learning rate applied to optimizer")
+                    # Special handling for learning rate changes
+                    if param == 'learning_rate':
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = new_val
+                        self.logger.info(f"  Learning rate applied to optimizer")
             
 
 
@@ -119,14 +120,14 @@ class PPOUpdater:
         self.cumulative_episodes += unique_episodes
         advantages, returns = self.compute_advantages(rollout_buffer)
 
-        self.log_value_function_diagnostics(rollout_buffer, iteration)
+        # self.log_value_function_diagnostics(rollout_buffer, iteration)
 
         # Existing validation
-        ranking_results = self.validate_value_function_ranking(rollout_buffer)
-        wandb.log({
-            "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
-            "iteration": iteration
-        })
+        # ranking_results = self.validate_value_function_ranking(rollout_buffer)
+        # wandb.log({
+        #     "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
+        #     "iteration": iteration
+        # })
 
         # Convert to tensors
         advantages = torch.FloatTensor(advantages).to(self.device)
@@ -134,6 +135,20 @@ class PPOUpdater:
         old_logprobs = torch.FloatTensor(
             [exp["old_logprob"] for exp in rollout_buffer]
         ).to(self.device)
+
+        # ADVANTAGE TRACKING: Compute advantage statistics
+        advantage_stats = {
+            "mean": advantages.mean().item(),
+            "std": advantages.std().item(),
+            "min": advantages.min().item(),
+            "max": advantages.max().item(),
+            "median": advantages.median().item(),
+            "q25": advantages.quantile(0.25).item(),
+            "q75": advantages.quantile(0.75).item(),
+            "positive_ratio": (advantages > 0).float().mean().item(),
+            "zero_ratio": (advantages == 0).float().mean().item(),
+            "abs_mean": advantages.abs().mean().item()
+        }
 
         # Check for non-finite values in inputs
         if not (returns.isfinite().all() and old_logprobs.isfinite().all()):
@@ -150,6 +165,8 @@ class PPOUpdater:
         total_combined_loss = 0
         num_updates = 0
 
+        advantage_usage_stats = []
+
         accumulation_steps = self.config.accumulation_steps
         effective_batch_size = min(self.config.batch_size, len(rollout_buffer))
 
@@ -157,7 +174,6 @@ class PPOUpdater:
         for epoch in tqdm(range(self.config.ppo_epochs), desc="Running PPO"):
             indices = torch.randperm(len(rollout_buffer))
 
-            batch_count = 0
             for start in range(0, len(rollout_buffer), effective_batch_size):
                 end = start + effective_batch_size
                 batch_indices = indices[start:end]
@@ -167,6 +183,14 @@ class PPOUpdater:
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
                 batch_old_logprobs = old_logprobs[batch_indices]
+
+                # ADVANTAGE TRACKING: Track batch advantage statistics
+                batch_adv_stats = {
+                    "batch_adv_mean": batch_advantages.mean().item(),
+                    "batch_adv_std": batch_advantages.std().item(),
+                    "batch_adv_abs_mean": batch_advantages.abs().mean().item(),
+                }
+                advantage_usage_stats.append(batch_adv_stats)
 
                 # Prepare inputs
                 batch_states = [exp["state"] for exp in batch_experiences]
@@ -222,11 +246,13 @@ class PPOUpdater:
                         wandb.log({"warning": "Non-finite loss values"})
                         continue
 
+                    regularizer_loss = F.softplus(-(torch.cat(current_action_logprobs) + 12)).sum()
+
                     total_loss = (
                         policy_loss
                         + self.dynamic_config.get('value_loss_coef') * value_loss
                         # - self.dynamic_config.get('entropy_coef') * entropy
-                        + 0.01 * F.softplus(-(current_action_logprobs + 10)).sum()
+                        + 0.01 * regularizer_loss
                     ) / accumulation_steps
 
                 self.scaler.scale(total_loss).backward()
@@ -262,6 +288,13 @@ class PPOUpdater:
 
         self.scheduler.step()
 
+        if advantage_usage_stats:
+            avg_batch_adv_mean = sum(stat["batch_adv_mean"] for stat in advantage_usage_stats) / len(advantage_usage_stats)
+            avg_batch_adv_std = sum(stat["batch_adv_std"] for stat in advantage_usage_stats) / len(advantage_usage_stats)
+            avg_batch_adv_abs_mean = sum(stat["batch_adv_abs_mean"] for stat in advantage_usage_stats) / len(advantage_usage_stats)
+        else:
+            avg_batch_adv_mean = avg_batch_adv_std = avg_batch_adv_abs_mean = 0.0
+
         if num_updates > 0:
             current_lr = self.optimizer.param_groups[0]["lr"]
             wandb.log(
@@ -276,6 +309,19 @@ class PPOUpdater:
                     "episodes_per_update": unique_episodes,
                     "dynamic/value_loss_coef": self.dynamic_config.get('value_loss_coef'),
                     "dynamic/entropy_coef": self.dynamic_config.get('entropy_coef'),
+                    "advantages/mean": advantage_stats["mean"],
+                    "advantages/std": advantage_stats["std"],
+                    "advantages/min": advantage_stats["min"],
+                    "advantages/max": advantage_stats["max"],
+                    "advantages/median": advantage_stats["median"],
+                    "advantages/q25": advantage_stats["q25"],
+                    "advantages/q75": advantage_stats["q75"],
+                    "advantages/positive_ratio": advantage_stats["positive_ratio"],
+                    "advantages/zero_ratio": advantage_stats["zero_ratio"],
+                    "advantages/abs_mean": advantage_stats["abs_mean"],
+                    "advantages/batch_avg_mean": avg_batch_adv_mean,
+                    "advantages/batch_avg_std": avg_batch_adv_std,
+                    "advantages/batch_avg_abs_mean": avg_batch_adv_abs_mean,
                 }
             )
 
