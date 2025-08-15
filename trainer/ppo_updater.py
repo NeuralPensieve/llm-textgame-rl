@@ -29,6 +29,8 @@ class PPOUpdater:
         self.last_config_check = 0
         self.config_check_interval = 1  # Check every batch
 
+        self.kl_coef = config.kl_coef if config.use_kl_penalty else 0.0
+
     def compute_advantages(
         self, rollout_buffer: List[Dict]
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -91,7 +93,7 @@ class PPOUpdater:
 
         return advantages, returns
 
-    def ppo_update(self, rollout_buffer: List[Dict], iteration: int):
+    def ppo_update(self, rollout_buffer: List[Dict], iteration: int, temperature: float):
         """PPO policy update"""
         self.logger.info(f"\nIteration: {iteration}")
 
@@ -120,14 +122,14 @@ class PPOUpdater:
         self.cumulative_episodes += unique_episodes
         advantages, returns = self.compute_advantages(rollout_buffer)
 
-        # self.log_value_function_diagnostics(rollout_buffer, iteration)
+        self.log_value_function_diagnostics(rollout_buffer, iteration)
 
         # Existing validation
-        # ranking_results = self.validate_value_function_ranking(rollout_buffer)
-        # wandb.log({
-        #     "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
-        #     "iteration": iteration
-        # })
+        ranking_results = self.validate_value_function_ranking(rollout_buffer)
+        wandb.log({
+            "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
+            "iteration": iteration
+        })
 
         # Convert to tensors
         advantages = torch.FloatTensor(advantages).to(self.device)
@@ -135,6 +137,16 @@ class PPOUpdater:
         old_logprobs = torch.FloatTensor(
             [exp["old_logprob"] for exp in rollout_buffer]
         ).to(self.device)
+
+        if self.config.debug_mode:
+            # Get first batch for debugging
+            batch_experiences = rollout_buffer[:self.config.batch_size]
+            
+            # DEBUG: Compare scoring methods (only on first iteration)
+            if iteration == 0:
+                # debug_results = self.debug_action_scoring_comparison(batch_experiences)
+                # self.logger.info(f"Debug results: {debug_results}")
+                self.debug_action_scoring_detailed(batch_experiences, temperature)
 
         # ADVANTAGE TRACKING: Compute advantage statistics
         advantage_stats = {
@@ -174,6 +186,8 @@ class PPOUpdater:
         for epoch in tqdm(range(self.config.ppo_epochs), desc="Running PPO"):
             indices = torch.randperm(len(rollout_buffer))
 
+            epoch_kl_values = []
+
             for start in range(0, len(rollout_buffer), effective_batch_size):
                 end = start + effective_batch_size
                 batch_indices = indices[start:end]
@@ -202,8 +216,24 @@ class PPOUpdater:
                 # Forward pass
                 with autocast(self.device.type):
                     current_action_logprobs, current_values = self.policy.evaluate_actions(
-                        batch_states, batch_action_lists
+                        batch_states, batch_action_lists, temperature
                     )
+
+                    # Compute KL divergence if enabled
+                    kl_div = torch.tensor(0.0, device=self.device)
+                    if self.config.use_kl_penalty:
+                        # Get reference model's action scores
+                        reference_action_logprobs = self.policy.get_reference_action_scores(
+                            batch_states, batch_action_lists, temperature
+                        )
+                        
+                        # Compute KL divergence
+                        kl_div = self.policy.compute_kl_divergence(
+                            current_action_logprobs,
+                            reference_action_logprobs
+                        )
+                        
+                        epoch_kl_values.append(kl_div.item())
 
                     batch_chosen_logprobs = []
                     batch_entropy = []
@@ -246,13 +276,14 @@ class PPOUpdater:
                         wandb.log({"warning": "Non-finite loss values"})
                         continue
 
-                    regularizer_loss = F.softplus(-(torch.cat(current_action_logprobs) + 12)).sum()
+                    # regularizer_loss = F.softplus(-(torch.cat(current_action_logprobs) + 12)).sum()
 
                     total_loss = (
                         policy_loss
                         + self.dynamic_config.get('value_loss_coef') * value_loss
-                        # - self.dynamic_config.get('entropy_coef') * entropy
-                        + 0.01 * regularizer_loss
+                        - self.dynamic_config.get('entropy_coef') * entropy
+                        # + 0.01 * regularizer_loss
+                        + self.kl_coef * kl_div
                     ) / accumulation_steps
 
                 self.scaler.scale(total_loss).backward()
@@ -307,6 +338,7 @@ class PPOUpdater:
                     "learning_rate": current_lr,
                     "cumulative_episodes": self.cumulative_episodes,
                     "episodes_per_update": unique_episodes,
+                    "kl_divergence": np.mean(epoch_kl_values) if epoch_kl_values else 0.0,
                     "dynamic/value_loss_coef": self.dynamic_config.get('value_loss_coef'),
                     "dynamic/entropy_coef": self.dynamic_config.get('entropy_coef'),
                     "advantages/mean": advantage_stats["mean"],
@@ -329,7 +361,10 @@ class PPOUpdater:
                 f"Policy Loss: {total_policy_loss/num_updates:.4f}, "
                 f"Value Loss: {total_value_loss/num_updates:.4f}, "
                 f"Entropy: {total_entropy/num_updates:.4f}, "
-                f"LR: {current_lr:.2e}"
+                f"LR: {current_lr:.2e}, "
+                f"KL Stats - Mean: {np.mean(epoch_kl_values):.4f}, "
+                f"Max: {np.max(epoch_kl_values, initial=0.0):.4f}, "
+                f"Min: {np.min(epoch_kl_values, initial=0.0):.4f}"
                 "\n\n"
             )
 
@@ -587,3 +622,235 @@ class PPOUpdater:
             "total_comparisons": total_comparisons,
             "ranking_issues": ranking_issues[:5]  # Show first 5 issues for debugging
         }
+    
+    def debug_action_scoring_comparison(self, batch_experiences, temperature):
+        """
+        Debug script to compare reference vs current action scoring methods.
+        Call this right after getting the first batch in ppo_update.
+        """
+        print("\n" + "="*80)
+        print("DEBUGGING ACTION SCORING COMPARISON")
+        print("="*80)
+
+        self.policy.model.eval()
+        print(f"[debug] Model training mode: {self.policy.model.training}")
+        
+        # Extract first few examples for comparison
+        debug_size = min(3, len(batch_experiences))  # Compare first 3 examples
+        debug_experiences = batch_experiences[:debug_size]
+        
+        batch_states = [exp["state"] for exp in debug_experiences]
+        batch_action_lists = [exp["available_actions"] for exp in debug_experiences]
+        
+        print(f"Comparing {debug_size} examples...")
+        
+        # Get scores from both methods
+        print("\n1. Getting reference model scores...")
+        reference_logprobs = self.policy.get_reference_action_scores(batch_states, batch_action_lists, temperature)
+        
+        print("\n2. Getting current model scores...")
+        current_logprobs, _ = self.policy.evaluate_actions(batch_states, batch_action_lists, temperature)
+        
+        # Compare state by state
+        for state_idx in range(debug_size):
+            print(f"\n--- STATE {state_idx} ---")
+            print(f"Actions: {batch_action_lists[state_idx]}")
+            
+            ref_scores = reference_logprobs[state_idx]
+            cur_scores = current_logprobs[state_idx]
+            
+            print(f"\nReference log probs: {ref_scores.detach().cpu().numpy()}")
+            print(f"Current log probs:   {cur_scores.detach().cpu().numpy()}")
+            
+            # Convert to probabilities for easier interpretation
+            ref_probs = torch.exp(ref_scores).detach().cpu().numpy()
+            cur_probs = torch.exp(cur_scores).detach().cpu().numpy()
+            
+            print(f"\nReference probs: {ref_probs}")
+            print(f"Current probs:   {cur_probs}")
+            
+            # Check if they're close
+            logprob_diff = torch.abs(ref_scores - cur_scores).max().item()
+            prob_diff = np.abs(ref_probs - cur_probs).max()
+            
+            print(f"\nMax logprob difference: {logprob_diff:.6f}")
+            print(f"Max prob difference:    {prob_diff:.6f}")
+            
+            if logprob_diff < 1e-4:
+                print("✅ MATCH: Scores are nearly identical")
+            elif logprob_diff < 0.1:
+                print("⚠️  SMALL DIFF: Scores are close but not identical")
+            else:
+                print("❌ BIG DIFF: Scores are significantly different")
+                
+            # Compute KL divergence for this state
+            kl_div = torch.sum(torch.exp(cur_scores) * (cur_scores - ref_scores)).item()
+            print(f"KL divergence: {kl_div:.6f}")
+        
+        # Overall comparison
+        print(f"\n--- OVERALL COMPARISON ---")
+        all_ref_scores = torch.cat(reference_logprobs)
+        all_cur_scores = torch.cat(current_logprobs)
+        
+        overall_logprob_diff = torch.abs(all_ref_scores - all_cur_scores).max().item()
+        mean_logprob_diff = torch.abs(all_ref_scores - all_cur_scores).mean().item()
+        
+        print(f"Max overall logprob difference: {overall_logprob_diff:.6f}")
+        print(f"Mean overall logprob difference: {mean_logprob_diff:.6f}")
+        
+        # Check if models are actually the same
+        print(f"\n--- MODEL COMPARISON ---")
+        ref_param = next(self.policy.reference_model.parameters())
+        cur_param = next(self.policy.model.parameters())
+        models_identical = torch.allclose(ref_param, cur_param, atol=1e-6)
+        
+        print(f"Models identical: {models_identical}")
+        if not models_identical:
+            param_diff = torch.abs(ref_param - cur_param).max().item()
+            print(f"Max parameter difference: {param_diff:.6e}")
+        
+        print("="*80)
+        print("END DEBUG COMPARISON")
+        print("="*80)
+        
+        return {
+            'max_logprob_diff': overall_logprob_diff,
+            'mean_logprob_diff': mean_logprob_diff,
+            'models_identical': models_identical
+        }
+    
+
+    def debug_action_scoring_detailed(self, batch_experiences, temperature):
+        """Detailed debugging to find the exact difference in scoring methods"""
+        print("\n" + "="*80)
+        print("DETAILED ACTION SCORING DEBUG")
+        print("="*80)
+        
+        # Take just ONE example for detailed analysis
+        exp = batch_experiences[0]
+        state = exp["state"]
+        actions = exp["available_actions"]
+        
+        print(f"State: {state[:100]}...")
+        print(f"Actions: {actions}")
+        print(f"Number of actions: {len(actions)}")
+        
+        # 1. Build prompts for this state (same as reference model does)
+        action_prompts = []
+        metadata = []
+        
+        for i, action in enumerate(actions):
+            prompt = self.policy.prompt_manager.get_action_prompt(state, actions, action)
+            action_prompts.append(prompt)
+            metadata.append((0, action.strip()))
+        
+        print(f"\nNumber of prompts created: {len(action_prompts)}")
+        
+        # 2. Tokenize prompts
+        ref_inputs = self.policy.tokenize_prompts(action_prompts)
+        ref_inputs = {k: v.to(self.policy.model.device) for k, v in ref_inputs.items()}
+
+        print(f"[debug] Input shape: {ref_inputs['input_ids'].shape}")  
+        print(f"[debug] First prompt tokens (last 10): {ref_inputs['input_ids'][0, -10:].tolist()}")
+        
+        # ==================== CRITICAL DEBUG SECTION ====================
+        print("\n--- COMPARING MODELS ---")
+        
+        # Check if gradient checkpointing is the issue
+        print(f"Main model gradient checkpointing: {self.policy.model.is_gradient_checkpointing}")
+        print(f"Reference model gradient checkpointing: {self.policy.reference_model.is_gradient_checkpointing if hasattr(self.policy.reference_model, 'is_gradient_checkpointing') else 'N/A'}")
+        
+        # Check if models have same parameters
+        with torch.no_grad():
+            # Compare first layer parameters
+            main_first_param = next(self.policy.model.parameters())
+            ref_first_param = next(self.policy.reference_model.parameters())
+            param_diff = (main_first_param - ref_first_param).abs().max().item()
+            print(f"Max parameter difference (first layer): {param_diff}")
+            
+            # Test both models on SAME input with gradient checkpointing disabled temporarily
+            print("\n--- Testing with gradient checkpointing DISABLED for both ---")
+            
+            # Temporarily disable gradient checkpointing
+            original_gc_state = self.policy.model.is_gradient_checkpointing
+            if hasattr(self.policy.model, 'gradient_checkpointing_disable'):
+                self.policy.model.gradient_checkpointing_disable()
+            
+            # Get outputs from both models
+            main_outputs = self.policy.model(**ref_inputs)
+            ref_outputs = self.policy.reference_model(**ref_inputs)
+            
+            # Compare logits
+            logit_diff = (main_outputs.logits - ref_outputs.logits).abs().max().item()
+            print(f"Max logit difference (both without GC): {logit_diff}")
+            
+            # Re-enable gradient checkpointing if it was on
+            if original_gc_state and hasattr(self.policy.model, 'gradient_checkpointing_enable'):
+                self.policy.model.gradient_checkpointing_enable()
+            
+            # Now test with gradient checkpointing as configured
+            print("\n--- Testing with original gradient checkpointing settings ---")
+            main_outputs_gc = self.policy.model(**ref_inputs)
+            ref_outputs_no_gc = self.policy.reference_model(**ref_inputs)
+            
+            logit_diff_gc = (main_outputs_gc.logits - ref_outputs_no_gc.logits).abs().max().item()
+            print(f"Max logit difference (main with GC, ref without): {logit_diff_gc}")
+        
+        # ==================== SCORE COMPUTATION DEBUG ====================
+        print("\n--- COMPUTING SCORES MANUALLY FOR BOTH MODELS ---")
+        
+        with torch.no_grad():
+            # Get logits from main model (with GC)
+            main_logits = main_outputs_gc.logits
+            
+            # Get logits from reference model (without GC)  
+            ref_logits = ref_outputs_no_gc.logits
+            
+            print(f"Main logits shape: {main_logits.shape}")
+            print(f"Ref logits shape: {ref_logits.shape}")
+            
+            # Compute scores for first action as example
+            action = actions[0]
+            action_tokens = self.policy.tokenizer.encode(f" {action}", add_special_tokens=False)
+            print(f"\nFirst action: '{action}'")
+            print(f"Action tokens: {action_tokens}")
+            
+            n = len(action_tokens)
+            
+            # Main model scores
+            main_token_logits = []
+            for i, token_id in enumerate(action_tokens):
+                pos = -(n-i)
+                logit = main_logits[0, pos, token_id]
+                main_token_logits.append(logit.item())
+                print(f"  Main model - Token {i} at pos {pos}: {logit.item():.4f}")
+            
+            main_avg = sum(main_token_logits) / len(main_token_logits)
+            print(f"  Main model average: {main_avg:.4f}")
+            
+            # Reference model scores
+            ref_token_logits = []
+            for i, token_id in enumerate(action_tokens):
+                pos = -(n-i)
+                logit = ref_logits[0, pos, token_id]
+                ref_token_logits.append(logit.item())
+                print(f"  Ref model - Token {i} at pos {pos}: {logit.item():.4f}")
+            
+            ref_avg = sum(ref_token_logits) / len(ref_token_logits)
+            print(f"  Reference model average: {ref_avg:.4f}")
+            
+            print(f"  Difference: {abs(main_avg - ref_avg):.4f}")
+        
+        # ==================== CHECK EVALUATE_ACTIONS ====================
+        print("\n--- CHECKING EVALUATE_ACTIONS METHOD ---")
+        
+        # Call evaluate_actions and see what it does internally
+        with torch.no_grad():
+            # We need to trace through evaluate_actions
+            cur_logprobs, cur_values = self.policy.evaluate_actions([state], [actions], temperature)
+            
+            print(f"evaluate_actions returned logprobs: {cur_logprobs[0].tolist()}")
+            
+        print("="*80)
+        print("END DEBUG")
+        print("="*80)

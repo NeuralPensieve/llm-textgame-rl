@@ -17,12 +17,14 @@ class LLMPolicy(nn.Module):
         self.prompt_manager = PromptManager(config.scoring_method)
         self.logger = logging.getLogger(__name__)
 
-        # Load pretrained model and tokenizer
+        # 1. Load Tokenizer
+        # Set up the tokenizer, adding a padding token if it's missing.
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Load model configuration with use_cache=False
+        # 2. Load Main Policy Model
+        # Load the model configuration, ensuring use_cache=False for training efficiency.
         model_config = AutoConfig.from_pretrained(config.model_name, use_cache=False)
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
@@ -30,21 +32,73 @@ class LLMPolicy(nn.Module):
             device_map="auto",
             max_memory={0: "8GB"},
         )
-
-        # Enable gradient checkpointing for memory efficiency
+        
+        # Enable gradient checkpointing on the main model to save memory during training.
         self.model.gradient_checkpointing_enable()
 
-        # Add value head
+        # 3. Create Value Head
+        # The value head predicts the value of a state (V(s)).
         hidden_size = self.model.config.hidden_size
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_size // 2, 1),
-        ).to(self.model.device)
+        ).to(self.model.device) # Move the head to the same device as the model.
 
-        # Always cache target tokens, as 'high' is needed for value scoring
+        # 4. Create Reference Model for KL Divergence (if enabled)
+        if config.use_kl_penalty:
+            # Load a second, separate instance of the model to act as a fixed reference.
+            # This is the correct way to do it with `device_map="auto"`.
+            self.reference_model = AutoModelForCausalLM.from_pretrained(
+                config.model_name,
+                config=model_config,
+                device_map="auto",
+                max_memory={0: "8GB"},
+            )
+            
+            # Freeze the reference model's parameters and set it to evaluation mode.
+            # It should never be trained.
+            for param in self.reference_model.parameters():
+                param.requires_grad = False
+            self.reference_model.eval()
+            
+            # Disable gradient checkpointing for the reference model for faster inference.
+            if hasattr(self.reference_model, 'gradient_checkpointing_disable'):
+                self.reference_model.gradient_checkpointing_disable()
+
+            # Optionally convert the reference model to FP16 to save memory.
+            if config.reference_fp16:
+                self.reference_model = self.reference_model.half()
+
+        # 5. Cache Target Tokens for Scoring
         self._cache_target_tokens()
+
+        # 6. Final Sanity Check
+        # This check confirms that the main and reference models are identical at initialization.
+        if config.use_kl_penalty:
+            self.logger.info("Running model identity sanity check...")
+            with torch.no_grad():
+                # Set both models to eval mode for a deterministic comparison.
+                self.model.eval()
+                
+                dummy_input = self.tokenizer("hello world", return_tensors="pt").to(self.model.device)
+                
+                # Perform a direct, identical forward pass on both base models.
+                main_outputs = self.model(**dummy_input)
+                ref_outputs = self.reference_model(**dummy_input)
+                
+                # Assert that their logits are close, accounting for potential dtype differences.
+                assert torch.allclose(
+                    main_outputs.logits.float(), 
+                    ref_outputs.logits.float(), 
+                    atol=1e-5
+                ), "Model and reference model outputs do not match after initialization!"
+                
+                self.logger.info("✅ Sanity check passed: Models are identical.")
+                
+                # IMPORTANT: Set the main model back to train mode for PPO updates.
+                self.model.train()
 
     def _cache_target_tokens(self):
         """Cache target token IDs for 'helpful' scoring"""
@@ -116,6 +170,7 @@ class LLMPolicy(nn.Module):
         metadata: List[Tuple],
         num_states: int,
         action_prompts: List[str],
+        temperature: float,
     ) -> List[torch.Tensor]:
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
@@ -126,6 +181,13 @@ class LLMPolicy(nn.Module):
             for idx, ((env_idx, action), prompt) in enumerate(
                 zip(metadata, action_prompts)
             ):
+                if self.config.debug_mode:
+                    # DEBUG: Print what we're processing
+                    if idx == 0:  # Just first action for debugging
+                        print(f"\n[compute_action_scores] Processing first action:")
+                        print(f"  Action: '{action}'")
+                        print(f"  Logits shape for this prompt: {logits[idx].shape}")
+
                 action_tokens = self.tokenizer.encode(
                     " " + action.strip(), add_special_tokens=False
                 )
@@ -135,10 +197,19 @@ class LLMPolicy(nn.Module):
                 if prompt_tokens != action_tokens:
                     raise ValueError(f"Token mismatch for action '{action.strip()}'")
 
-                logprobs_i = logits[idx, -n:]
-                actions_tensor = torch.tensor(action_tokens, device=logits.device)
-                selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-                env_action_logprobs[env_idx].append(selected.mean())
+                token_logits = []
+                for i, token_id in enumerate(action_tokens):
+                    pos = -(n-i)
+                    logit = logits[idx, pos, token_id]
+                    token_logits.append(logit)
+
+                    if self.config.debug_mode:
+                        # DEBUG: Print token details for first action
+                        if idx == 0:
+                            print(f"    Token {i} (id={token_id}, pos={pos}): {logit.item():.4f}")
+                
+                avg_score = torch.stack(token_logits).mean()
+                env_action_logprobs[env_idx].append(avg_score)
         elif self.prompt_manager.scoring_method == "helpful":
             # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
             helpful_token_id = self.target_tokens["helpful"]
@@ -148,15 +219,15 @@ class LLMPolicy(nn.Module):
         else:
             raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
 
-        env_action_logprobs = [F.log_softmax(torch.stack(row) / self.config.temperature, dim=-1) for row in env_action_logprobs]
+        env_action_logprobs = [F.log_softmax(torch.stack(row) / temperature, dim=-1) for row in env_action_logprobs]
 
         return env_action_logprobs
 
     def evaluate_actions(
-        self, states: List[str], action_lists: List[List[str]]
+        self, states: List[str], action_lists: List[List[str]], temperature: float
     ) -> Tuple[List[List[torch.Tensor]], torch.Tensor]:
         """Evaluate actions with gradients (for training)"""
-        self.train()
+        self.model.train()
         
         # Build action prompts
         action_prompts = []
@@ -172,16 +243,22 @@ class LLMPolicy(nn.Module):
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
         
         with autocast(self.model.device.type):
-            action_logits, _ = self.forward(**action_inputs)
-        
+            action_outputs = self.model(**action_inputs)
+            action_logits = action_outputs.logits
+
+        if self.config.debug_mode:
+            print(f"[evaluate_actions] Input shape: {action_inputs['input_ids'].shape}")
+            print(f"[evaluate_actions] First prompt tokens (last 10): {action_inputs['input_ids'][0, -10:].tolist()}")
+
         env_action_logprobs = self.compute_action_scores(
             action_logits,
             action_inputs["input_ids"],
             metadata,
             len(states),
             action_prompts,
+            temperature,
         )
-
+        
         state_inputs = self.tokenize_prompts(states)  # Just tokenize states directly
         state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
         
@@ -195,8 +272,8 @@ class LLMPolicy(nn.Module):
         self, states: List[str], action_lists: List[List[str]]
     ) -> Tuple[List[List[float]], List[float]]:
         """Evaluate actions without gradients (for rollout collection)"""
-        self.eval()
-        env_action_logprobs = []
+        self.model.eval()
+        env_action_scores = []
 
         for state, actions in zip(states, action_lists):
             # Create action prompts
@@ -228,9 +305,9 @@ class LLMPolicy(nn.Module):
                                 f"Action tokens do not match for action '{actions[i]}'"
                             )
 
-                        logprobs_i = logits[i, -n:]
+                        logits_i = logits[i, -n:]
                         actions_tensor = torch.tensor(tokens, device=logits.device)
-                        selected = logprobs_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+                        selected = logits_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
                         action_scores.append(selected.mean())
                 elif self.prompt_manager.scoring_method == "helpful":
                     # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
@@ -242,17 +319,17 @@ class LLMPolicy(nn.Module):
 
                 # Apply temperature and normalize (matching compute_action_scores)
                 action_scores_tensor = torch.stack(action_scores)
-                action_logprobs = F.log_softmax(action_scores_tensor / self.config.temperature, dim=-1)
-                env_action_logprobs.append(action_logprobs.cpu().tolist())
+                env_action_scores.append(action_scores_tensor.cpu().tolist())
 
-        state_inputs = self.tokenize_prompts(states)  # Just states
+        # --- Value computation ---
+        state_inputs = self.tokenize_prompts(states)
         state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
         
         with torch.no_grad(), autocast(self.model.device.type):
-            _, values = self.forward(**state_inputs)
+            _, values = self.forward(**state_inputs)  # Fixed this line
             values_list = values.squeeze(-1).cpu().tolist()
-
-        return env_action_logprobs, values_list
+        
+        return env_action_scores, values_list
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates"""
@@ -260,3 +337,68 @@ class LLMPolicy(nn.Module):
             {"params": self.model.parameters(), "lr": self.config.learning_rate, "name": "pretrained"},
             {"params": self.value_head.parameters(), "lr": self.config.learning_rate_value_head, "name": "value_head"},
         ]
+    
+    def get_reference_action_scores(self, states: List[str], action_lists: List[List[str]], temperature: float) -> List[torch.Tensor]:
+        """Get action scores from reference model using same averaging method"""
+
+        with torch.no_grad():
+            # Build prompts and metadata
+            action_prompts = []
+            metadata = []  # (state_idx, action_text)
+            
+            for i, (state, actions) in enumerate(zip(states, action_lists)):
+                for action in actions:
+                    prompt = self.prompt_manager.get_action_prompt(state, actions, action)
+                    action_prompts.append(prompt)
+                    metadata.append((i, action.strip()))
+            
+            # Tokenize all prompts
+            inputs = self.tokenize_prompts(action_prompts)
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            # Get reference model logits (FP16 if configured)
+            with autocast(self.model.device.type, enabled=self.config.reference_fp16):
+                ref_outputs = self.reference_model(**inputs)
+                ref_logits = ref_outputs.logits
+            
+            # Extract and average logits for each action
+            env_action_scores = [[] for _ in range(len(states))]
+            
+            for idx, ((env_idx, action), prompt) in enumerate(zip(metadata, action_prompts)):
+                action_tokens = self.tokenizer.encode(f" {action}", add_special_tokens=False)
+                n = len(action_tokens)
+                
+                # Extract logits for action tokens
+                token_logits = []
+                for i, token_id in enumerate(action_tokens):
+                    pos = -(n-i)
+                    logit = ref_logits[idx, pos, token_id]
+                    token_logits.append(logit)
+
+                avg_score = torch.stack(token_logits).mean()
+                env_action_scores[env_idx].append(avg_score)
+            
+            # Convert to log probabilities
+            reference_logprobs = []
+            for scores in env_action_scores:
+                scores_tensor = torch.stack(scores)
+                logprobs = F.log_softmax(scores_tensor / temperature, dim=-1)
+                reference_logprobs.append(logprobs)
+            
+            return reference_logprobs
+    
+    def compute_kl_divergence(
+        self, 
+        current_action_logprobs: List[torch.Tensor],
+        reference_action_logprobs: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """Compute KL divergence between current and reference policies"""
+        kl_divs = []
+        
+        for curr_logprobs, ref_logprobs in zip(current_action_logprobs, reference_action_logprobs):            
+            # Compute KL(current || reference)
+            # KL(P||Q) = Σ P(x) * log(P(x)/Q(x))
+            kl = (torch.exp(curr_logprobs) * (curr_logprobs - ref_logprobs)).sum()
+            kl_divs.append(kl)
+        
+        return torch.stack(kl_divs).mean()

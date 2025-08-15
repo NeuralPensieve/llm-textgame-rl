@@ -9,6 +9,7 @@ class PPOConfig:
     max_length: int = 512  # Maximum sequence length
     scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     dynamic_config: bool = False
+    debug_mode: bool = False
     
 
     # Environment
@@ -28,8 +29,6 @@ class PPOConfig:
     ppo_epochs: int = 4
     gamma: float = 0.9
     gae_lambda: float = 0.95
-    value_loss_coef: float = 2.0
-    entropy_coef: float = 0.001
     max_grad_norm: float = 0.5
     normalize_advantage: bool = True
 
@@ -38,6 +37,11 @@ class PPOConfig:
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
+
+    # Loss settings
+    value_loss_coef: float = 2.0
+    entropy_coef: float = 0.1
+    kl_coef: float = 0.001  # Start with 0.1, tune based on results
 
     # LoRA settings
     lora_enabled: bool = False  # Enable LoRA
@@ -48,10 +52,16 @@ class PPOConfig:
     epsilon: float = 0.0
     epsilon_decay: float = 0.95
     min_epsilon: float = 0.0
-    temperature: float = 1.0
-    sampling_temperature: float = 1.0
-    softmax_floor: float = 0.05
+    temperature: float = 20.0
+    min_temperature: float = 1.0
+    temperature_decay: float = 0.95
+
 
     # Evaluation
     num_eval_episodes: int = 20
     num_sample_games: int = 5
+
+    # KL Penalty settings
+    use_kl_penalty: bool = False  # ONLY works with action_token
+    target_kl: float = 0.02  # Optional early stopping if KL divergence too high
+    reference_fp16: bool = False  # Use FP16 for reference model to save memory

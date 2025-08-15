@@ -50,6 +50,7 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         # Training state
         self.epsilon = config.epsilon
+        self.temperature = config.temperature
 
         os.makedirs("checkpoints", exist_ok=True)
 
@@ -85,7 +86,7 @@ class PPOTextWorldTrainer(BaseTrainer):
 
             # Run evaluation
             if iteration % self.config.eval_interval == 0:
-                eval_length, eval_reward = self.evaluator.run_evaluation(iteration)
+                eval_length, eval_reward = self.evaluator.run_evaluation(iteration, self.temperature)
                 wandb.log(
                     {
                         "iteration": iteration,
@@ -94,12 +95,9 @@ class PPOTextWorldTrainer(BaseTrainer):
                     }
                 )
 
-            # Update epsilon in rollout collector
-            self.rollout_collector.update_epsilon(self.epsilon)
-
             # Collect rollouts
             rollout_buffer, episode_lengths, episode_rewards = (
-                self.rollout_collector.collect_rollouts()
+                self.rollout_collector.collect_rollouts(temperature=self.temperature, epsilon=self.epsilon)
             )
 
             # Calculate metrics
@@ -110,11 +108,16 @@ class PPOTextWorldTrainer(BaseTrainer):
             total_episode_reward = np.sum(episode_rewards)
 
             # Update policy
-            self.ppo_updater.ppo_update(rollout_buffer, iteration)
+            self.ppo_updater.ppo_update(rollout_buffer, iteration, self.temperature)
 
             # Decay epsilon
             self.epsilon = max(
                 self.config.min_epsilon, self.epsilon * self.config.epsilon_decay
+            )
+
+            # Decay temperature
+            self.temperature = max(
+                self.config.min_temperature, self.temperature * self.config.temperature_decay
             )
 
             # Calculate iteration duration and normalize by rollout size
@@ -137,6 +140,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     "total_episode_reward": total_episode_reward,
                     "total_experiences": len(rollout_buffer),
                     "epsilon": self.epsilon,
+                    "temperature": self.temperature,
                     "iteration_duration": iteration_duration,
                     "normalized_iteration_duration": normalized_duration,
                 }
@@ -187,5 +191,6 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         # Update components with loaded state
         self.rollout_collector.update_epsilon(self.epsilon)
+        self.rollout_collector.update_temperature(self.temperature)
 
         self.logger.info(f"Checkpoint loaded: {checkpoint_path}")

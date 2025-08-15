@@ -15,10 +15,9 @@ class RolloutCollector:
         self.config = config
         self.device = device
         self.logger = logger
-        self.epsilon = config.epsilon
 
-    def collect_rollouts(self) -> Tuple[List[Dict], List[int], List[float]]:
-        """Collect experience from environments"""
+    def collect_rollouts(self, temperature: float, epsilon: float) -> Tuple[List[Dict], List[int], List[float]]:
+        """Collect experience from environments"""        
         rollout_buffer = []
         
         # Initialize states
@@ -45,25 +44,19 @@ class RolloutCollector:
 
             # Evaluate actions
             with torch.no_grad(), autocast(self.device.type):
-                action_logprobs, values = self.policy.evaluate_for_rollout(
+                action_scores, values = self.policy.evaluate_for_rollout(
                     batch_states, batch_actions
                 )
 
             # Step each environment
             new_states = []
             
-            for i, (env, state, actions, logprobs, value) in enumerate(
-                zip(self.envs, states, batch_actions, action_logprobs, values)
+            for i, (env, state, actions, scores, value) in enumerate(
+                zip(self.envs, states, batch_actions, action_scores, values)
             ):
-                # Select action (epsilon-greedy)
-                # if random.random() < self.epsilon:
-                #     action_idx = random.randint(0, len(actions) - 1)
-                # else:
-                #     action_idx = np.argmax(logprobs)
-
-                action_idx, old_logprob_indexed = self.temperature_sampling_with_floor(np.array(logprobs))
+                # Get action and original logprob from the new sampling method
+                action_idx, old_logprob_indexed = self.temperature_sampling(scores, temperature)
                 
-
                 chosen_action = actions[action_idx]
                 
                 # Take step in environment
@@ -120,27 +113,43 @@ class RolloutCollector:
             states = new_states
 
         return rollout_buffer, all_episode_lengths, all_episode_rewards
-
-    def update_epsilon(self, new_epsilon: float):
-        """Update epsilon for epsilon-greedy exploration"""
-        self.epsilon = new_epsilon
     
-    def temperature_sampling_with_floor(self, logprobs):
-        # Convert from log-probs to probs
-        probs = np.exp(logprobs)
+    def temperature_sampling(self, raw_scores, temperature):
+        """
+        Apply temperature sampling to raw action scores with numerical stability.
         
-        # Apply temperature
-        probs = probs ** (1 / self.config.sampling_temperature)
-        probs /= probs.sum()
+        Args:
+            raw_scores: Raw action scores (logits) from the policy.
+            temperature: Temperature parameter for sampling.
+        
+        Returns:
+            action_idx: The selected action index.
+            old_logprob: The log probability of the selected action from the original policy.
+        """
+        scores = np.array(raw_scores)
+        
+        # Apply temperature for sampling distribution
+        scaled_scores = scores / temperature
+        
+        # Create sampling probabilities with numerical stability
+        # Subtracting the max score prevents overflow when exponentiating
+        scaled_scores_stable = scaled_scores - np.max(scaled_scores)
+        sampling_probs = np.exp(scaled_scores_stable)
+        sampling_probs /= sampling_probs.sum()
+        
+        # Ensure probabilities are normalized due to potential floating point inaccuracies
+        sampling_probs = sampling_probs / np.sum(sampling_probs)
 
-        # Apply hard floor to every action's probability
-        probs = np.maximum(probs, self.config.softmax_floor)
-        probs /= probs.sum()
-
-        # Sample action
-        action_idx = np.random.choice(len(probs), p=probs)
-
-        # Get the log-prob from the modified distribution
-        old_logprob = np.log(probs[action_idx] + 1e-8)
-
+        # Sample an action from the modified distribution
+        action_idx = np.random.choice(len(sampling_probs), p=sampling_probs)
+        
+        # Now, calculate the log probability from the ORIGINAL, non-scaled scores
+        # This is the log-softmax function, also with a stability trick
+        original_scores_stable = scores - np.max(scores)
+        exp_scores = np.exp(original_scores_stable)
+        log_sum_exp = np.log(np.sum(exp_scores))
+        original_logprobs = original_scores_stable - log_sum_exp
+        
+        old_logprob = original_logprobs[action_idx]
+        
         return action_idx, old_logprob

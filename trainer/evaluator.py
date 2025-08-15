@@ -17,6 +17,11 @@ class Evaluator:
         self.device = device
         self.logger = logger
 
+    def _softmax(self, x: np.ndarray) -> np.ndarray:
+        """Compute softmax values for x with numerical stability."""
+        e_x = np.exp(x - np.max(x))
+        return e_x / e_x.sum(axis=0)
+
     def _run_single_episode(self, episode_idx: int, log_details: bool = False) -> Dict:
         """Run a single episode and return results with optional detailed logging"""
         env = TextWorldEnvironment(difficulty=self.config.difficulty, repeatable=self.config.repeatable)
@@ -37,26 +42,30 @@ class Evaluator:
             # Get valid actions
             actions = env.get_valid_actions()
 
-            # Get policy evaluation
+            # Get raw action scores from the policy
             with torch.no_grad(), autocast(self.device.type):
-                action_logprobs, value = self.policy.evaluate_for_rollout(
+                # This now returns raw scores, not log probabilities
+                action_scores, value = self.policy.evaluate_for_rollout(
                     [state], [actions]
                 )
 
-            # Select best action deterministically (argmax)
-            action_idx = np.argmax(action_logprobs[0])
+            # Select best action deterministically (argmax works on raw scores)
+            scores = np.array(action_scores[0])
+            action_idx = np.argmax(scores)
             chosen_action = actions[action_idx]
 
             if log_details:
-                # Log the step details
+                # Convert scores to probabilities for logging
+                action_probs = self._softmax(scores)
+                
                 game_log.append(f"Step {step_count + 1}:")
                 game_log.append(f"  Available Actions: {actions}")
+                # Log the correctly calculated probabilities
                 game_log.append(
-                    f"  Action Probabilities: {[f'{np.exp(prob):.3e}' for prob in action_logprobs[0]]}"
+                    f"  Action Probabilities: {[f'{prob:.3e}' for prob in action_probs]}"
                 )
                 game_log.append(f"  Chosen Action: {chosen_action}")
                 game_log.append(f"  State Value: {value[0]:.3f}")
-
             # Take the action
             next_state, reward, done, info = env.step(chosen_action)
             total_reward += reward
@@ -95,7 +104,7 @@ class Evaluator:
             "game_log": "\n".join(game_log) if log_details else None
         }
 
-    def run_evaluation(self, iteration: int) -> Tuple[float, float]:
+    def run_evaluation(self, iteration: int, temperature: float) -> Tuple[float, float]:
         """Run evaluation rollouts with deterministic policy (no epsilon-greedy)"""
         self.logger.info("\n\nRunning evaluation...")
         
@@ -110,7 +119,7 @@ class Evaluator:
         all_episodes = []  # Track ALL episodes (completed or not)
         
         for i in tqdm(range(num_sample_games), desc="Generating sample games"):
-            episode_result = self._run_single_episode(i, log_details=True)
+            episode_result = self._run_single_episode(episode_idx=i, log_details=True)
             sample_games.append(episode_result["game_log"])
             all_episodes.append(episode_result)
         
@@ -118,7 +127,7 @@ class Evaluator:
         remaining_episodes = num_eval_episodes - num_sample_games
         
         for i in tqdm(range(remaining_episodes), desc="Running additional evaluation episodes"):
-            episode_result = self._run_single_episode(num_sample_games + i, log_details=False)
+            episode_result = self._run_single_episode(episode_idx=num_sample_games + i, log_details=False)
             all_episodes.append(episode_result)
         
         # Calculate evaluation metrics from ALL episodes (completed or not)
