@@ -4,8 +4,10 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Model settings
-    # model_name: str = "microsoft/DialoGPT-large"  # Smaller model for RTX 3060
-    model_name: str = "openai-community/gpt2"
+    model_name: str = "microsoft/DialoGPT-small"  # Smaller model for RTX 3060
+    # model_name: str = "openai-community/gpt2"
+    # model_name: str = "google/gemma-3-270m-it"
+    # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 512  # Maximum sequence length
     scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     dynamic_config: bool = False
@@ -18,7 +20,9 @@ class PPOConfig:
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
     num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = True
+    repeatable: bool = False
+    step_penalty: float = 0.1
+    history_len: int = 3
 
     # PPO hyperparameters
     batch_size: int = 4
@@ -40,8 +44,8 @@ class PPOConfig:
 
     # Loss settings
     value_loss_coef: float = 2.0
-    entropy_coef: float = 0.1
-    kl_coef: float = 0.001  # Start with 0.1, tune based on results
+    entropy_coef: float = 0.05
+    kl_coef: float = 0.1  # Start with 0.1, tune based on results
 
     # LoRA settings
     lora_enabled: bool = False  # Enable LoRA
@@ -52,9 +56,9 @@ class PPOConfig:
     epsilon: float = 0.0
     epsilon_decay: float = 0.95
     min_epsilon: float = 0.0
-    temperature: float = 20.0
+    temperature: float = 5.0
     min_temperature: float = 1.0
-    temperature_decay: float = 0.95
+    temperature_decay: float = 0.9
 
 
     # Evaluation
@@ -62,6 +66,5 @@ class PPOConfig:
     num_sample_games: int = 5
 
     # KL Penalty settings
-    use_kl_penalty: bool = False  # ONLY works with action_token
-    target_kl: float = 0.02  # Optional early stopping if KL divergence too high
-    reference_fp16: bool = False  # Use FP16 for reference model to save memory
+    use_kl_penalty: bool = True  # ONLY works with action_token
+    reference_fp16: bool = True  # Use FP16 for reference model to save memory

@@ -46,6 +46,12 @@ class LLMPolicy(nn.Module):
             nn.Linear(hidden_size // 2, 1),
         ).to(self.model.device) # Move the head to the same device as the model.
 
+        # Log the number of parameters for both the main model and the value head.
+        model_params = sum(p.numel() for p in self.model.parameters())
+        value_head_params = sum(p.numel() for p in self.value_head.parameters())
+        self.logger.info(f"Policy model parameters: {model_params / 1e6:.2f}M")
+        self.logger.info(f"Value head parameters: {value_head_params / 1e3:.2f}K")
+
         # 4. Create Reference Model for KL Divergence (if enabled)
         if config.use_kl_penalty:
             # Load a second, separate instance of the model to act as a fixed reference.
@@ -66,10 +72,6 @@ class LLMPolicy(nn.Module):
             # Disable gradient checkpointing for the reference model for faster inference.
             if hasattr(self.reference_model, 'gradient_checkpointing_disable'):
                 self.reference_model.gradient_checkpointing_disable()
-
-            # Optionally convert the reference model to FP16 to save memory.
-            if config.reference_fp16:
-                self.reference_model = self.reference_model.half()
 
         # 5. Cache Target Tokens for Scoring
         self._cache_target_tokens()
@@ -96,6 +98,10 @@ class LLMPolicy(nn.Module):
                 ), "Model and reference model outputs do not match after initialization!"
                 
                 self.logger.info("✅ Sanity check passed: Models are identical.")
+
+                # Optionally convert the reference model to FP16 to save memory.
+                if config.reference_fp16:
+                    self.reference_model = self.reference_model.half()
                 
                 # IMPORTANT: Set the main model back to train mode for PPO updates.
                 self.model.train()

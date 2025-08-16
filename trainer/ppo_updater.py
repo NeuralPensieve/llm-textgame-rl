@@ -7,7 +7,7 @@ from collections import defaultdict
 from torch.amp import autocast
 from tqdm import tqdm
 
-from config.dynamic_config_manager import DynamicConfigManager
+from config import DynamicConfigManager
 
 
 class PPOUpdater:

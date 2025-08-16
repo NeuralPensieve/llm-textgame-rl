@@ -30,8 +30,12 @@ class BaseTrainer(ABC):
             project="textworld-llm-ppo",
             name=run_name,
             config=vars(self.config),
-            settings=wandb.Settings(code_dir="../"),
+            settings=wandb.Settings(
+                save_code=True,
+                code_dir='.'
+                ),
         )
+        wandb.save("**/*.py", base_path=".")
 
         # Create a folder, if doesn't exist, for evaluations with run_name
         os.makedirs("evaluations", exist_ok=True)

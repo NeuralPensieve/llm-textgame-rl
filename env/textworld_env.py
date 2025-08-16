@@ -5,33 +5,47 @@ import os
 import tempfile
 import shutil
 
+from config import PPOConfig
+
 
 class TextWorldEnvironment:
     """Wrapper for TextWorld environment with enhanced difficulty settings"""
 
-    def __init__(self, game_file: str = None, seed: int = None, step_penalty: float = 0.1, difficulty: str = "easy", gamma=0.9, repeatable=False):
-        self.max_steps = 50
+    def __init__(self, config: PPOConfig, game_file: str = None):
+        self.config = config
+        self.max_steps = config.num_steps
         self.current_step = 0
         self.done = False
         self.last_score = 0
         self.game_state = None
-        self.step_penalty = step_penalty
-        self.base_seed = seed if seed is not None else random.randint(1, 1000000)
+        self.step_penalty = config.step_penalty
+        self.base_seed = config.env_seed if config.env_seed is not None else random.randint(1, 1000000)
         self.seed = self.base_seed
-        self.difficulty = difficulty
-        self.game_file = game_file  # Store game file for reset
-        self.temp_dir = None  # Track temporary directory for cleanup
-        self.temp_game_file = None  # Track temporary game file
-        self.repeatable = repeatable
-        self.gamma = gamma
+        self.difficulty = config.difficulty
+        self.game_file = game_file
+        self.temp_dir = None
+        self.temp_game_file = None
+        self.repeatable = config.repeatable
+        self.gamma = config.gamma
+        self.history_len = config.history_len
 
+        request_infos = self._get_request_infos()
         if game_file:
-            # Initialize with a real TextWorld game file (e.g., zork1.z5)
-            request_infos = textworld.EnvInfos(admissible_commands=True, inventory=True)
             self.env = textworld.start(game_file, request_infos=request_infos)
         else:
-            # Create a simple TextWorld game if no game file is provided
             self.env = self._create_simple_game()
+
+    def _get_request_infos(self):
+        """Centralized method for requesting game info."""
+        return textworld.EnvInfos(
+            admissible_commands=True, 
+            inventory=True,
+            description=True,
+            score=True,
+            won=True,
+            lost=True,
+            objective=True  # Ensure the objective is requested
+        )
 
     def _cleanup_temp_files(self):
         """Clean up any temporary files and directories"""

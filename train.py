@@ -2,7 +2,7 @@ import wandb
 import os
 import argparse
 
-from config.ppo_config import PPOConfig
+from config import PPOConfig
 from trainer import PPOTextWorldTrainer
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"

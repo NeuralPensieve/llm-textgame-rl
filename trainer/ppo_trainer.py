@@ -8,10 +8,7 @@ from torch.amp import GradScaler
 from env import TextWorldEnvironment
 from config import PPOConfig
 from models import LLMPolicy
-from trainer.base_trainer import BaseTrainer
-from trainer.rollout_collector import RolloutCollector
-from trainer.evaluator import Evaluator
-from trainer.ppo_updater import PPOUpdater
+from trainer import BaseTrainer, RolloutCollector, Evaluator, PPOUpdater
 
 
 class PPOTextWorldTrainer(BaseTrainer):
@@ -29,7 +26,7 @@ class PPOTextWorldTrainer(BaseTrainer):
                     os.remove(os.path.join("./games", f))
 
         # Create environments and policy
-        self.envs = [TextWorldEnvironment(difficulty=self.config.difficulty, repeatable=self.config.repeatable) for _ in range(config.num_envs)]
+        self.envs = [TextWorldEnvironment(config=config) for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
 
         # Disable cache for transformer models during training
