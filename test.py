@@ -2,7 +2,7 @@ import argparse
 from env import TextWorldEnvironment
 from config import PPOConfig
 
-def play_textworld(config, seed: int = None, difficulty: str = "easy"):
+def play_textworld(config):
     # Initialize the environment with the provided seed or a random one
     env = TextWorldEnvironment(config=config)
     state = env.reset()
@@ -62,5 +62,7 @@ if __name__ == "__main__":
     parser.add_argument('--difficulty', type=str, default='medium', help='Difficulty level')
     args = parser.parse_args()
     config = PPOConfig()
+    config.difficulty = args.difficulty
+    config.env_seed = args.seed
 
-    play_textworld(config, args.seed, args.difficulty)
+    play_textworld(config)

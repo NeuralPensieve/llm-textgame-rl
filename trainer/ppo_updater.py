@@ -21,75 +21,66 @@ class PPOUpdater:
         self.scaler = scaler
         self.device = device
         self.logger = logger
-        self.cumulative_episodes = 0
-
         self.dynamic_config = DynamicConfigManager(config, logger)
-
-        # Track when coefficients change for logging
-        self.last_config_check = 0
-        self.config_check_interval = 1  # Check every batch
-
         self.kl_coef = config.kl_coef if config.use_kl_penalty else 0.0
 
-    def compute_advantages(
-        self, rollout_buffer: List[Dict]
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute GAE advantages and returns."""
-        grouped_experiences = defaultdict(list)
+    def compute_advantages(self, rollout_buffer: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute GAE advantages and returns, correctly handling episode boundaries
+        within the rollout buffer.
+        """
+        # Group experiences by environment index only.
+        experiences_by_env = defaultdict(list)
         for exp in rollout_buffer:
-            grouped_experiences[(exp["env_idx"], exp["episode_id"])].append(exp)
+            experiences_by_env[exp["env_idx"]].append(exp)
 
         all_advantages = []
         all_returns = []
 
-        for key, experiences in grouped_experiences.items():
+        # Process each environment's trajectory independently.
+        for env_idx in sorted(experiences_by_env.keys()):
+            experiences = experiences_by_env[env_idx]
             if not experiences:
                 continue
 
-            last_advantage = 0.0
-            # Determine the bootstrap value for the very last state in the trajectory.
-            # If the episode was truncated (not 'done'), bootstrap from its value estimate.
-            # Otherwise (it was a terminal state), the value is 0.
+            advantages_ep = np.zeros(len(experiences), dtype=np.float32)
+            returns_ep = np.zeros(len(experiences), dtype=np.float32)
+            
+            # Bootstrap value from the last state if the episode was truncated by the rollout limit.
             last_exp = experiences[-1]
-            if last_exp["truncated"] and not last_exp["done"]:
-                # This handles episodes cut short by the rollout limit.
+            if not last_exp["done"]:
                 next_value = last_exp["value"]
             else:
-                # This handles true terminal states.
                 next_value = 0.0
-
-            advantages_ep = []
-            returns_ep = []
             
-            # Loop backwards through the experiences
-            for exp in reversed(experiences):
-                # The value of the state after the current one is 'next_value'.
+            last_advantage = 0.0
+            
+            # Loop backwards through the experiences for this environment.
+            for i, exp in reversed(list(enumerate(experiences))):
                 delta = exp["reward"] + self.config.gamma * next_value - exp["value"]
-                
-                # Calculate the advantage using the GAE formula
                 advantage = delta + self.config.gamma * self.config.gae_lambda * last_advantage
                 
-                # The return is the advantage plus the value of the current state
-                returns_ep.append(advantage + exp["value"])
-                advantages_ep.append(advantage)
+                returns_ep[i] = advantage + exp["value"]
+                advantages_ep[i] = advantage
 
-                # Update carriers for the next iteration (which is the previous time step)
-                last_advantage = advantage
-                next_value = exp["value"] # The current state's value becomes the next state's value for the previous step
+                if exp["done"]:
+                    last_advantage = 0.0
+                    next_value = 0.0
+                else:
+                    last_advantage = advantage
+                    next_value = exp["value"]
 
-            # Reverse the lists to be in chronological order and add to the main buffer
-            advantages_ep.reverse()
-            returns_ep.reverse()
-            all_advantages.extend(advantages_ep)
-            all_returns.extend(returns_ep)
+            all_advantages.append(advantages_ep)
+            all_returns.append(returns_ep)
 
-        advantages = np.array(all_advantages, dtype=np.float32)
-        returns = np.array(all_returns, dtype=np.float32)
+        advantages_by_env_step = list(zip(*[adv for adv in all_advantages]))
+        returns_by_env_step = list(zip(*[ret for ret in all_returns]))
         
-        if len(advantages) > 1 and self.config.normalize_advantage:
+        advantages = np.array([item for sublist in advantages_by_env_step for item in sublist])
+        returns = np.array([item for sublist in returns_by_env_step for item in sublist])
+
+        if self.config.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        advantages = np.clip(advantages, -5, 5)
 
         return advantages, returns
 
@@ -113,23 +104,17 @@ class PPOUpdater:
                             param_group['lr'] = new_val
                         self.logger.info(f"  Learning rate applied to optimizer")
             
-
-
-        # Count unique episodes in the rollout buffer
-        unique_episodes = len(
-            set((exp["env_idx"], exp["episode_id"]) for exp in rollout_buffer)
-        )
-        self.cumulative_episodes += unique_episodes
         advantages, returns = self.compute_advantages(rollout_buffer)
 
         self.log_value_function_diagnostics(rollout_buffer, iteration)
 
         # Existing validation
-        ranking_results = self.validate_value_function_ranking(rollout_buffer)
-        wandb.log({
-            "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
-            "iteration": iteration
-        })
+        if self.config.debug_mode:
+            ranking_results = self.validate_value_function_ranking(rollout_buffer)
+            wandb.log({
+                "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
+                "iteration": iteration
+            })
 
         # Convert to tensors
         advantages = torch.FloatTensor(advantages).to(self.device)
@@ -176,6 +161,7 @@ class PPOUpdater:
         total_entropy = 0
         total_combined_loss = 0
         num_updates = 0
+        max_seq_len = 0
 
         advantage_usage_stats = []
 
@@ -191,6 +177,114 @@ class PPOUpdater:
             for start in range(0, len(rollout_buffer), effective_batch_size):
                 end = start + effective_batch_size
                 batch_indices = indices[start:end]
+
+                # --- ADD THIS FINAL DEBUG BLOCK ---
+                if iteration == 0 and epoch == 0 and start == 0:
+                    self.logger.info("\n--- STARTING DIRECT FORWARD PASS COMPARISON ---")
+                    
+                    # 1. Manually prepare the exact inputs that will be used
+                    batch_experiences = [rollout_buffer[i] for i in batch_indices]
+                    batch_states = [exp["state"] for exp in batch_experiences]
+                    batch_action_lists = [exp["available_actions"] for exp in batch_experiences]
+
+                    prompts = []
+                    for i, (state, actions) in enumerate(zip(batch_states, batch_action_lists)):
+                        for action in actions:
+                            prompt = self.policy.prompt_manager.get_action_prompt(state, actions, action)
+                            prompts.append(prompt)
+                    
+                    # 2. Tokenize ONCE to get a single, definitive input tensor
+                    inputs = self.policy.tokenize_prompts(prompts)
+                    inputs_on_device = {k: v.to(self.policy.model.device) for k, v in inputs.items()}
+                    
+                    # 3. Get logits from both models in EVAL mode using the SAME input tensor
+                    self.policy.model.eval()
+                    with torch.no_grad():
+                        # --- Main Model Pass (with autocast) ---
+                        with torch.amp.autocast(self.device.type):
+                            main_outputs_ac = self.policy.model(**inputs_on_device)
+                        main_logits_ac = main_outputs_ac.logits.float()
+
+                        # --- Reference Model Pass (with autocast) ---
+                        with torch.amp.autocast(self.device.type):
+                            ref_outputs_ac = self.policy.reference_model(**inputs_on_device)
+                        ref_logits_ac = ref_outputs_ac.logits.float()
+
+                        # --- Main Model Pass (WITHOUT autocast) ---
+                        main_outputs_fp32 = self.policy.model(**inputs_on_device)
+                        main_logits_fp32 = main_outputs_fp32.logits.float()
+
+                        # --- Reference Model Pass (WITHOUT autocast) ---
+                        ref_outputs_fp32 = self.policy.reference_model(**inputs_on_device)
+                        ref_logits_fp32 = ref_outputs_fp32.logits.float()
+
+                    # 4. Perform the crucial comparisons
+                    self.logger.info("\n--- COMPARISON WITH AUTOCAST (FP16/BF16) ---")
+                    ac_diff = torch.abs(main_logits_ac - ref_logits_ac).max().item()
+                    self.logger.info(f"  Max absolute logit difference: {ac_diff:.8f}")
+                    self.logger.info(f"  Are logits close? {torch.allclose(main_logits_ac, ref_logits_ac)}")
+
+                    self.logger.info("\n--- COMPARISON WITHOUT AUTOCAST (FP32) ---")
+                    fp32_diff = torch.abs(main_logits_fp32 - ref_logits_fp32).max().item()
+                    self.logger.info(f"  Max absolute logit difference: {fp32_diff:.8f}")
+                    self.logger.info(f"  Are logits close? {torch.allclose(main_logits_fp32, ref_logits_fp32)}")
+                    
+                    self.policy.model.train() # Restore mode
+                    self.logger.info("\n--- FINISHED DIRECT COMPARISON ---\n")
+
+                    self.logger.info("\n--- TESTING TRAIN VS. EVAL HYPOTHESIS ---")
+    
+                    # Use the exact same batch data for all tests
+                    batch_experiences_test = [rollout_buffer[i] for i in batch_indices]
+                    batch_states_test = [exp["state"] for exp in batch_experiences_test]
+                    batch_action_lists_test = [exp["available_actions"] for exp in batch_experiences_test]
+
+                    with torch.no_grad():
+                        # 1. Get baseline logprobs from the reference model (NO gradient checkpointing).
+                        reference_logprobs = self.policy.get_reference_action_scores(
+                            batch_states_test, batch_action_lists_test, temperature
+                        )
+
+                        # 2. Get logprobs from the main model in eval mode but WITH its default gradient checkpointing.
+                        self.policy.model.eval()
+                        current_logprobs_with_gc, _, _ = self.policy.evaluate_actions(
+                            batch_states_test, batch_action_lists_test, temperature
+                        )
+                        kl_div_with_gc = self.policy.compute_kl_divergence(
+                            current_logprobs_with_gc, reference_logprobs
+                        ).item()
+                        self.logger.info(f"  KL (Main Model Eval, WITH GC): {kl_div_with_gc:.6f} <-- The persistent high value.")
+
+                        # 3. CRITICAL TEST: Disable gradient checkpointing on the main model and re-calculate.
+                        # Store the original state to restore it later
+                        was_checkpointing = self.policy.model.is_gradient_checkpointing
+                        if was_checkpointing:
+                            self.policy.model.gradient_checkpointing_disable()
+                        
+                        # Ensure it's still in eval mode for a fair comparison
+                        self.policy.model.eval() 
+                        current_logprobs_without_gc, _, _ = self.policy.evaluate_actions(
+                            batch_states_test, batch_action_lists_test, temperature
+                        )
+                        
+                        # IMPORTANT: Restore the model's original settings for training
+                        if was_checkpointing:
+                            self.policy.model.gradient_checkpointing_enable()
+                        self.policy.model.train()
+
+                        kl_div_without_gc = self.policy.compute_kl_divergence(
+                            current_logprobs_without_gc, reference_logprobs
+                        ).item()
+                        self.logger.info(f"  KL (Main Model Eval, WITHOUT GC): {kl_div_without_gc:.6f} <-- The expected near-zero value.")
+
+                        # 4. Assert the new hypothesis.
+                        if abs(kl_div_without_gc) < 1e-5:
+                            self.logger.info("  ✅ HYPOTHESIS CONFIRMED: Disabling gradient checkpointing resolves the discrepancy.")
+                        else:
+                            self.logger.error("  ❌ HYPOTHESIS REJECTED: The cause is even more subtle.")
+                            
+                    self.logger.info("--- END OF HYPOTHESIS TEST ---\n")
+                # --- END OF BLOCK ---
 
                 # Get batch data
                 batch_experiences = [rollout_buffer[i] for i in batch_indices]
@@ -208,16 +302,17 @@ class PPOUpdater:
 
                 # Prepare inputs
                 batch_states = [exp["state"] for exp in batch_experiences]
-                batch_action_lists = [
-                    exp["available_actions"] for exp in batch_experiences
-                ]
+
+                batch_action_lists = [exp["available_actions"] for exp in batch_experiences]
                 batch_action_indices = [exp["action_idx"] for exp in batch_experiences]
 
                 # Forward pass
                 with autocast(self.device.type):
-                    current_action_logprobs, current_values = self.policy.evaluate_actions(
+                    current_action_logprobs, current_values, current_seq_len = self.policy.evaluate_actions(
                         batch_states, batch_action_lists, temperature
                     )
+
+                    max_seq_len = max(max_seq_len, current_seq_len)
 
                     # Compute KL divergence if enabled
                     kl_div = torch.tensor(0.0, device=self.device)
@@ -232,6 +327,28 @@ class PPOUpdater:
                             current_action_logprobs,
                             reference_action_logprobs
                         )
+
+                        # --- ADD THIS DEBUG CODE ---
+                        if iteration == 0 and epoch == 0 and start == 0:
+                            self.logger.info(f"DEBUG: Initial KL (model in train mode): {kl_div.item():.6f}")
+
+                            # Temporarily switch model to eval mode to disable dropout
+                            self.policy.model.eval()
+                            with torch.no_grad(): # no_grad to be safe, though eval is the key
+                                # Re-evaluate the current policy's logprobs
+                                debug_current_logprobs, _, _ = self.policy.evaluate_actions(
+                                    batch_states, batch_action_lists, temperature
+                                )
+                                # Re-compute KL with the deterministic model
+                                debug_kl_div = self.policy.compute_kl_divergence(
+                                    debug_current_logprobs,
+                                    reference_action_logprobs
+                                )
+                                self.logger.info(f"DEBUG: Initial KL (model in eval mode): {debug_kl_div.item():.6f}")
+                            
+                            # IMPORTANT: Switch model back to train mode
+                            self.policy.model.train()
+                        # -------------------------
                         
                         epoch_kl_values.append(kl_div.item())
 
@@ -336,9 +453,8 @@ class PPOUpdater:
                     "total_loss": total_combined_loss / num_updates,
                     "entropy": total_entropy / num_updates,
                     "learning_rate": current_lr,
-                    "cumulative_episodes": self.cumulative_episodes,
-                    "episodes_per_update": unique_episodes,
                     "kl_divergence": np.mean(epoch_kl_values) if epoch_kl_values else 0.0,
+                    "max_seq_length": max_seq_len,
                     "dynamic/value_loss_coef": self.dynamic_config.get('value_loss_coef'),
                     "dynamic/entropy_coef": self.dynamic_config.get('entropy_coef'),
                     "advantages/mean": advantage_stats["mean"],
@@ -364,7 +480,8 @@ class PPOUpdater:
                 f"LR: {current_lr:.2e}, "
                 f"KL Stats - Mean: {np.mean(epoch_kl_values):.4f}, "
                 f"Max: {np.max(epoch_kl_values, initial=0.0):.4f}, "
-                f"Min: {np.min(epoch_kl_values, initial=0.0):.4f}"
+                f"Min: {np.min(epoch_kl_values, initial=0.0):.4f}, "
+                f"Max Batch Tokens: {max_seq_len}"
                 "\n\n"
             )
 
@@ -380,82 +497,95 @@ class PPOUpdater:
         return False
 
     def compute_td_errors_and_trajectories(self, rollout_buffer: List[Dict]) -> Dict:
-        """Compute TD errors and extract value trajectories for analysis."""
-        grouped_experiences = defaultdict(list)
-        for exp in rollout_buffer:
-            grouped_experiences[(exp["env_idx"], exp["episode_id"])].append(exp)
-        
-        all_td_errors = []
-        value_trajectories = []
-        episode_outcomes = []  # Track win/loss for each episode
-        
-        for (env_idx, episode_id), experiences in grouped_experiences.items():
-            if not experiences:
-                continue
-                
-            # Sort by step to ensure proper order
-            experiences.sort(key=lambda x: x.get('step', 0))
+            """Compute TD errors and extract value trajectories for analysis."""
+            # This correctly returns a list of episode lists.
+            episodes = self._reconstruct_episodes_from_buffer(rollout_buffer)
             
-            episode_td_errors = []
-            episode_values = []
-            episode_rewards = []
-            episode_states = []
-            
-            for i, exp in enumerate(experiences):
-                current_value = exp["value"]
-                reward = exp["reward"]
+            all_td_errors = []
+            value_trajectories = []
+            episode_outcomes = []
+
+            # --- CORRECTED LOOP ---
+            # Iterate directly over the list of episodes.
+            for experiences in episodes:
+                if not experiences:
+                    continue
+
+                # Get env_idx from the first experience in the episode.
+                env_idx = experiences[0]["env_idx"]
                 
-                # Compute TD error: δ = r + γV(s') - V(s)
-                if i < len(experiences) - 1:
-                    next_value = experiences[i + 1]["value"]
-                    td_error = reward + self.config.gamma * next_value - current_value
-                else:
-                    # Terminal state
-                    if exp["done"] and not exp["truncated"]:
-                        # True terminal state, next value is 0
-                        td_error = reward - current_value
+                episode_td_errors = []
+                episode_values = []
+                episode_rewards = []
+                
+                for i, exp in enumerate(experiences):
+                    current_value = exp["value"]
+                    reward = exp["reward"]
+                    
+                    # Compute TD error: δ = r + γV(s') - V(s)
+                    if i < len(experiences) - 1:
+                        next_value = experiences[i + 1]["value"]
+                        td_error = reward + self.config.gamma * next_value - current_value
                     else:
-                        # Truncated episode, use bootstrap value
-                        td_error = reward + self.config.gamma * current_value - current_value
+                        # For the last step, the next_value depends on whether it was a true 'done' state.
+                        next_value = 0.0 if exp["done"] else exp["value"] # Bootstrap if truncated
+                        td_error = reward + self.config.gamma * next_value - current_value
+
+                    episode_td_errors.append(td_error)
+                    episode_values.append(current_value)
+                    episode_rewards.append(reward)
                 
-                episode_td_errors.append(td_error)
-                episode_values.append(current_value)
-                episode_rewards.append(reward)
+                all_td_errors.extend(episode_td_errors)
                 
-                # Store state info for analysis (you might want to truncate long states)
-                state_preview = exp["state"][:100] + "..." if len(exp["state"]) > 100 else exp["state"]
-                episode_states.append(state_preview)
+                # Determine episode outcome
+                # Check if any step in the episode had a positive reward (a more robust way to check for a win)
+                episode_won = any(exp['reward'] > 0 for exp in experiences)
+                
+                value_trajectories.append({
+                    "env_idx": env_idx,
+                    "values": episode_values,
+                    "rewards": episode_rewards,
+                    "td_errors": episode_td_errors,
+                    "won": episode_won,
+                    "episode_length": len(experiences)
+                })
+                episode_outcomes.append(episode_won)
             
-            all_td_errors.extend(episode_td_errors)
+            td_errors_array = np.array(all_td_errors) if all_td_errors else np.array([0.0])
             
-            # Determine episode outcome (you'll need to adapt this to your reward structure)
-            final_reward = experiences[-1]["reward"]
-            episode_won = final_reward > 0  # Adjust this condition based on your game
-            
-            value_trajectories.append({
-                "env_idx": env_idx,
-                "episode_id": episode_id,
-                "values": episode_values,
-                "rewards": episode_rewards,
-                "td_errors": episode_td_errors,
-                "states": episode_states,
-                "won": episode_won,
-                "final_reward": final_reward,
-                "episode_length": len(experiences)
-            })
-            episode_outcomes.append(episode_won)
+            return {
+                "td_errors": td_errors_array,
+                "td_error_mean": td_errors_array.mean(),
+                "td_error_std": td_errors_array.std(),
+                "td_error_abs_mean": np.abs(td_errors_array).mean(),
+                "value_trajectories": value_trajectories,
+                "win_rate": np.mean(episode_outcomes) if episode_outcomes else 0.0,
+                "num_episodes": len(value_trajectories)
+            }
+    
+    def _reconstruct_episodes_from_buffer(self, rollout_buffer: List[Dict]) -> List[List[Dict]]:
+        """Reconstructs individual episodes from a flat rollout buffer."""
+        episodes = []
+        current_episodes = defaultdict(list)
         
-        td_errors_array = np.array(all_td_errors)
+        # Group by environment index first
+        experiences_by_env = defaultdict(list)
+        for exp in rollout_buffer:
+            experiences_by_env[exp["env_idx"]].append(exp)
+
+        for env_idx in sorted(experiences_by_env.keys()):
+            for exp in experiences_by_env[env_idx]:
+                current_episodes[env_idx].append(exp)
+                if exp["done"]:
+                    episodes.append(current_episodes[env_idx])
+                    current_episodes[env_idx] = []
         
-        return {
-            "td_errors": td_errors_array,
-            "td_error_mean": td_errors_array.mean(),
-            "td_error_std": td_errors_array.std(),
-            "td_error_abs_mean": np.abs(td_errors_array).mean(),
-            "value_trajectories": value_trajectories,
-            "win_rate": np.mean(episode_outcomes) if episode_outcomes else 0.0,
-            "num_episodes": len(value_trajectories)
-        }
+        # Add any unfinished episodes at the end of the buffer
+        for env_idx in sorted(current_episodes.keys()):
+            if current_episodes[env_idx]:
+                episodes.append(current_episodes[env_idx])
+
+        return episodes
 
     def log_value_function_diagnostics(self, rollout_buffer: List[Dict], iteration: int):
         """Log comprehensive value function diagnostics."""
@@ -649,7 +779,7 @@ class PPOUpdater:
         reference_logprobs = self.policy.get_reference_action_scores(batch_states, batch_action_lists, temperature)
         
         print("\n2. Getting current model scores...")
-        current_logprobs, _ = self.policy.evaluate_actions(batch_states, batch_action_lists, temperature)
+        current_logprobs, _, _ = self.policy.evaluate_actions(batch_states, batch_action_lists, temperature)
         
         # Compare state by state
         for state_idx in range(debug_size):
@@ -847,7 +977,7 @@ class PPOUpdater:
         # Call evaluate_actions and see what it does internally
         with torch.no_grad():
             # We need to trace through evaluate_actions
-            cur_logprobs, cur_values = self.policy.evaluate_actions([state], [actions], temperature)
+            cur_logprobs, cur_values, _ = self.policy.evaluate_actions([state], [actions], temperature)
             
             print(f"evaluate_actions returned logprobs: {cur_logprobs[0].tolist()}")
             

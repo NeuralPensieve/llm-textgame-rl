@@ -9,156 +9,151 @@ from env import TextWorldEnvironment
 
 
 class Evaluator:
-    """Handles policy evaluation and sample game generation"""
+    """
+    Handles policy evaluation by running a fixed set of N environments in parallel.
+    When an environment finishes, it becomes inactive and is not reset. The total
+    evaluation time is determined by the longest-running episode.
+    """
 
     def __init__(self, policy, config, device, logger):
         self.policy = policy
         self.config = config
         self.device = device
         self.logger = logger
+        self.num_envs = config.num_evals
 
     def _softmax(self, x: np.ndarray) -> np.ndarray:
         """Compute softmax values for x with numerical stability."""
         e_x = np.exp(x - np.max(x))
         return e_x / e_x.sum(axis=0)
 
-    def _run_single_episode(self, episode_idx: int, log_details: bool = False) -> Dict:
-        """Run a single episode and return results with optional detailed logging"""
-        env = TextWorldEnvironment(config=self.config)
-        state = env.reset()
+    def run_evaluation(self, iteration: int) -> Tuple[float, float]:
+        """
+        Run N parallel evaluation rollouts, where N is the number of environments.
+
+        Args:
+            iteration (int): The current training iteration number, for logging purposes.
+
+        Returns:
+            A tuple containing the average episode length and average episode reward.
+        """
+        self.logger.info(f"\n\nRunning fixed-set parallel evaluation with {self.num_envs} environments...")
+
+        # We will log up to 5 games in detail, or fewer if num_envs is smaller.
+        num_sample_games = min(self.num_envs, 5)
+
+        # --- Initialization ---
+        envs = [TextWorldEnvironment(config=self.config) for _ in range(self.num_envs)]
+        states = [env.reset() for env in envs]
+
+        # A mask to track which environments are still running.
+        active_mask = [True] * self.num_envs
+
+        # Trackers for each parallel environment.
+        current_rewards = np.zeros(self.num_envs)
+        current_lengths = np.zeros(self.num_envs, dtype=int)
         
-        game_log = []
-        if log_details:
-            game_log.append(f"=== SAMPLE GAME {episode_idx + 1} ===")
-            game_log.append(f"Initial State: {state}")
-            game_log.append("")
+        # Buffers to store detailed logs for the sample games.
+        game_logs = [[] for _ in range(num_sample_games)]
+        for i in range(num_sample_games):
+            game_logs[i].append(f"=== SAMPLE GAME {i + 1} ===")
+            game_logs[i].append(f"{states[i]}\n")
 
-        step_count = 0
-        total_reward = 0.0
-        max_steps = self.config.num_steps
-        done = False
+        finished_episodes = []
 
-        while step_count < max_steps:
-            # Get valid actions
-            actions = env.get_valid_actions()
+        # --- Main Evaluation Loop ---
+        # The loop continues as long as at least one environment is active.
+        with tqdm(total=self.num_envs, desc="Completing parallel episodes") as pbar:
+            while any(active_mask):
+                # 1. Build a batch ONLY from active environments.
+                active_indices = [i for i, active in enumerate(active_mask) if active]
+                batch_states = [states[i] for i in active_indices]
+                batch_actions = [envs[i].get_valid_actions() for i in active_indices]
 
-            # Get raw action scores from the policy
-            with torch.no_grad(), autocast(self.device.type):
-                # This now returns raw scores, not log probabilities
-                action_scores, value = self.policy.evaluate_for_rollout(
-                    [state], [actions]
-                )
+                # 2. Get model outputs for the active batch. The batch size may shrink over time.
+                with torch.no_grad(), autocast(self.device.type):
+                    action_scores, values = self.policy.evaluate_for_rollout(batch_states, batch_actions)
 
-            # Select best action deterministically (argmax works on raw scores)
-            scores = np.array(action_scores[0])
-            action_idx = np.argmax(scores)
-            chosen_action = actions[action_idx]
+                # 3. Process results and step each active environment.
+                for i, original_idx in enumerate(active_indices):
+                    # If an environment has no actions, it's a terminal state.
+                    if not batch_actions[i]:
+                        done = True
+                        info = {} # Ensure info dict exists
+                    else:
+                        scores = np.array(action_scores[i])
+                        action_idx = np.argmax(scores)
+                        chosen_action = batch_actions[i][action_idx]
 
-            if log_details:
-                # Convert scores to probabilities for logging
-                action_probs = self._softmax(scores)
-                
-                game_log.append(f"Step {step_count + 1}:")
-                game_log.append(f"  Available Actions: {actions}")
-                # Log the correctly calculated probabilities
-                game_log.append(
-                    f"  Action Probabilities: {[f'{prob:.3e}' for prob in action_probs]}"
-                )
-                game_log.append(f"  Chosen Action: {chosen_action}")
-                game_log.append(f"  State Value: {value[0]:.3f}")
-            # Take the action
-            next_state, reward, done, info = env.step(chosen_action)
-            total_reward += reward
-            step_count += 1
+                        # Log details for sample games if this is a logging-enabled slot.
+                        if original_idx < num_sample_games:
+                            action_probs = self._softmax(scores)
+                            game_logs[original_idx].append(f"Step {current_lengths[original_idx] + 1}:")
+                            game_logs[original_idx].append(f"  Action Probabilities: {[f'{p:.3f}' for p in action_probs]}")
+                            game_logs[original_idx].append(f"  Chosen Action: {chosen_action} | State Value: {values[i]:.3f}")
 
-            if log_details:
-                game_log.append(f"  Reward: {reward}")
-                game_log.append(f"  Done: {done}")
-                game_log.append(f"  Next State: {next_state}")
-                game_log.append("")
+                        next_state, reward, done, info = envs[original_idx].step(chosen_action)
+                        
+                        current_rewards[original_idx] += reward
+                        current_lengths[original_idx] += 1
+                        states[original_idx] = next_state
+                        
+                        if original_idx < num_sample_games:
+                            game_logs[original_idx].append(f"  Reward: {reward}")
+                            if not done:
+                                game_logs[original_idx].append(f"\n{next_state}\n")
 
-            if done:
-                if log_details:
-                    game_log.append(f"Game completed in {step_count} steps!")
-                break
-            else:
-                # Update state with action context for next iteration
-                state = state + f"\n\naction taken: {chosen_action}\n\n" + next_state
+                    # 4. Handle finished episodes.
+                    if done or current_lengths[original_idx] >= self.config.num_steps:
+                        # Mark this environment as inactive for the next loop.
+                        active_mask[original_idx] = False
 
-        # Add game summary if logging details
-        if log_details:
-            game_log.append(f"=== GAME {episode_idx + 1} SUMMARY ===")
-            game_log.append(f"Total Steps: {step_count}")
-            game_log.append(f"Total Reward: {total_reward:.3f}")
-            game_log.append(f"Completed: {'Yes' if done else 'No (truncated)'}")
-            game_log.append("=" * 50)
-            game_log.append("")
+                        game_won = info.get("won", False)
 
-        # Clean up
-        del env
+                        # Finalize the detailed log if this was a sample game.
+                        if original_idx < num_sample_games:
+                            game_logs[original_idx].append(f"=== GAME {original_idx + 1} SUMMARY ===")
+                            game_logs[original_idx].append(f"Total Steps: {current_lengths[original_idx]}")
+                            game_logs[original_idx].append(f"Total Reward: {current_rewards[original_idx]:.3f}")
+                            completion_status = "Yes (Won)" if game_won else "No (Truncated or Lost)"
+                            game_logs[original_idx].append(f"Completed: {completion_status}")
+                            game_logs[original_idx].append("=" * 50)
 
-        return {
-            "length": step_count,
-            "reward": total_reward,
-            "completed": done,
-            "game_log": "\n".join(game_log) if log_details else None
-        }
-
-    def run_evaluation(self, iteration: int, temperature: float) -> Tuple[float, float]:
-        """Run evaluation rollouts with deterministic policy (no epsilon-greedy)"""
-        self.logger.info("\n\nRunning evaluation...")
+                        # Store the final result.
+                        finished_episodes.append({
+                            "length": current_lengths[original_idx],
+                            "reward": current_rewards[original_idx],
+                            "completed": game_won,
+                            "game_log": "\n".join(game_logs[original_idx]) if original_idx < num_sample_games else None
+                        })
+                        pbar.update(1)
+                        # --- NO RESET HERE. The environment slot is now done permanently. ---
         
-        # Run episodes for both evaluation metrics and sample game logging
-        num_eval_episodes = 20  # Episodes for metrics
-        num_sample_games = 5    # Episodes for detailed logging
-        
-        # First run sample games (with detailed logging)
-        wandb.log({"sample_games_log": f"Generating {num_sample_games} sample games..."})
-        
-        sample_games = []
-        all_episodes = []  # Track ALL episodes (completed or not)
-        
-        for i in tqdm(range(num_sample_games), desc="Generating sample games"):
-            episode_result = self._run_single_episode(episode_idx=i, log_details=True)
-            sample_games.append(episode_result["game_log"])
-            all_episodes.append(episode_result)
-        
-        # Then run additional episodes for evaluation metrics (without detailed logging)
-        remaining_episodes = num_eval_episodes - num_sample_games
-        
-        for i in tqdm(range(remaining_episodes), desc="Running additional evaluation episodes"):
-            episode_result = self._run_single_episode(episode_idx=num_sample_games + i, log_details=False)
-            all_episodes.append(episode_result)
-        
-        # Calculate evaluation metrics from ALL episodes (completed or not)
-        if all_episodes:
-            avg_episode_length = np.mean([ep["length"] for ep in all_episodes])
-            avg_episode_reward = np.mean([ep["reward"] for ep in all_episodes])
-            
-            # Count how many episodes completed successfully
-            completed_episodes = [ep for ep in all_episodes if ep["completed"]]
-            sample_completed = sum(1 for ep in all_episodes[:num_sample_games] if ep["completed"])
-            
-            self.logger.info(
-                f"Evaluation completed: {len(all_episodes)} total episodes, "
-                f"{len(completed_episodes)} naturally completed, "
-                f"Sample games completed: {sample_completed}/{num_sample_games}, "
-                f"Avg Length: {avg_episode_length:.2f}, "
-                f"Avg Reward: {avg_episode_reward:.4f}"
-            )
-        else:
-            avg_episode_length = 0.0
-            avg_episode_reward = 0.0
-            self.logger.warning("ALERT: No episodes run during evaluation!")
+        # --- Cleanup and Reporting ---
+        for env in envs:
+            env.close()
 
-        # Log sample games to file
-        all_games_text = "\n\n".join(sample_games)
+        avg_episode_length = np.mean([ep["length"] for ep in finished_episodes])
+        avg_episode_reward = np.mean([ep["reward"] for ep in finished_episodes])
+        completed_count = sum(1 for ep in finished_episodes if ep["completed"])
+        
+        sample_games_logs = sorted([ep["game_log"] for ep in finished_episodes if ep["game_log"] is not None])
+        sample_completed = sum(1 for ep in finished_episodes[:num_sample_games] if ep["completed"])
+
+        self.logger.info(
+            f"Evaluation completed: {len(finished_episodes)} total episodes run, "
+            f"{completed_count} won, "
+            f"Avg Length: {avg_episode_length:.2f}, "
+            f"Avg Reward: {avg_episode_reward:.4f}"
+        )
+
+        # Log sample games to file.
+        all_games_text = "\n\n".join(sample_games_logs)
         with open(f"evaluations/{wandb.run.name}.txt", "a") as f:
             f.write(f"Iteration: {iteration}\n")
-            f.write(f"Evaluation Metrics - Total Episodes: {len(all_episodes)}, ")
-            completed_count = sum(1 for ep in all_episodes if ep["completed"])
-            f.write(f"Naturally Completed: {completed_count}, ")
-            f.write(f"Sample Games Completed: {sum(1 for ep in all_episodes[:num_sample_games] if ep['completed'])}/{num_sample_games}, ")
+            f.write(f"Evaluation Metrics - Total Episodes: {len(finished_episodes)}, ")
+            f.write(f"Completed (Won): {completed_count}, ")
+            f.write(f"Sample Games Won: {sample_completed}/{num_sample_games}, ")
             f.write(f"Avg Length: {avg_episode_length:.2f}, Avg Reward: {avg_episode_reward:.4f}\n\n")
             f.write(all_games_text)
             f.write("\n\n")

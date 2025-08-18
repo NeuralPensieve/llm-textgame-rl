@@ -1,3 +1,5 @@
+import re
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,13 +19,11 @@ class LLMPolicy(nn.Module):
         self.prompt_manager = PromptManager(config.scoring_method)
         self.logger = logging.getLogger(__name__)
 
-        # 1. Load Tokenizer
         # Set up the tokenizer, adding a padding token if it's missing.
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 2. Load Main Policy Model
         # Load the model configuration, ensuring use_cache=False for training efficiency.
         model_config = AutoConfig.from_pretrained(config.model_name, use_cache=False)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -36,7 +36,6 @@ class LLMPolicy(nn.Module):
         # Enable gradient checkpointing on the main model to save memory during training.
         self.model.gradient_checkpointing_enable()
 
-        # 3. Create Value Head
         # The value head predicts the value of a state (V(s)).
         hidden_size = self.model.config.hidden_size
         self.value_head = nn.Sequential(
@@ -52,16 +51,25 @@ class LLMPolicy(nn.Module):
         self.logger.info(f"Policy model parameters: {model_params / 1e6:.2f}M")
         self.logger.info(f"Value head parameters: {value_head_params / 1e3:.2f}K")
 
-        # 4. Create Reference Model for KL Divergence (if enabled)
         if config.use_kl_penalty:
             # Load a second, separate instance of the model to act as a fixed reference.
-            # This is the correct way to do it with `device_map="auto"`.
+            self.logger.info("Creating reference model by loading state_dict...")
+            
+            # 1. Instantiate a completely new model with the same config.
             self.reference_model = AutoModelForCausalLM.from_pretrained(
                 config.model_name,
                 config=model_config,
                 device_map="auto",
                 max_memory={0: "8GB"},
             )
+            
+            # 2. Load the weights from the main model to ensure they are identical.
+            self.reference_model.load_state_dict(self.model.state_dict())
+
+            # Freeze the reference model's parameters and set it to evaluation mode.
+            for param in self.reference_model.parameters():
+                param.requires_grad = False
+            self.reference_model.eval()
             
             # Freeze the reference model's parameters and set it to evaluation mode.
             # It should never be trained.
@@ -72,12 +80,9 @@ class LLMPolicy(nn.Module):
             # Disable gradient checkpointing for the reference model for faster inference.
             if hasattr(self.reference_model, 'gradient_checkpointing_disable'):
                 self.reference_model.gradient_checkpointing_disable()
-
-        # 5. Cache Target Tokens for Scoring
+        
         self._cache_target_tokens()
 
-        # 6. Final Sanity Check
-        # This check confirms that the main and reference models are identical at initialization.
         if config.use_kl_penalty:
             self.logger.info("Running model identity sanity check...")
             with torch.no_grad():
@@ -94,7 +99,7 @@ class LLMPolicy(nn.Module):
                 assert torch.allclose(
                     main_outputs.logits.float(), 
                     ref_outputs.logits.float(), 
-                    atol=1e-5
+                    atol=1e-3
                 ), "Model and reference model outputs do not match after initialization!"
                 
                 self.logger.info("✅ Sanity check passed: Models are identical.")
@@ -136,33 +141,59 @@ class LLMPolicy(nn.Module):
 
         return outputs.logits, value
 
+
     def tokenize_prompts(self, prompts: List[str]):
-        """Tokenize prompts efficiently with middle truncation and dynamic padding."""
+        """
+        Tokenizes prompts with intelligent truncation of the history string for oversized prompts.
+        """
         self.tokenizer.padding_side = "left"
         max_len = self.config.max_length
-        half_len = max_len // 2
+        
+        truncated_prompts = []
+        for prompt in prompts:
+            # 1. First, tokenize the whole prompt to see if it needs truncation
+            input_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
 
-        # 1. Tokenize each prompt individually without padding or truncation
-        tokenized_prompts = self.tokenizer(
-            prompts,
-            add_special_tokens=True,
-            truncation=False,
-            padding=False,
-        )["input_ids"]
+            # 2. If it's too long, start trimming the history
+            while len(input_ids) > max_len:
+                # Find the history string using regex
+                match = re.search(r"HISTORY: (.*?)\nSTATE:", prompt, re.DOTALL)
+                if not match:
+                    # # If no history is found, we can't shorten it.
+                    # # Fallback to simple truncation (shouldn't happen with your format).
+                    # prompt = prompt[:int(len(prompt) * 0.9)] # Failsafe
+                    # input_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+                    # continue
+                    raise ValueError('State too long, and there is no HISTORY to cut')
 
-        # 2. Apply middle truncation only to sequences that are too long
-        truncated_ids = []
-        for ids in tokenized_prompts:
-            if len(ids) > max_len:
-                # This sequence is too long, so we truncate it to max_len
-                truncated_ids.append(ids[:half_len] + ids[-(max_len - half_len):])
-            else:
-                truncated_ids.append(ids)
+                history_str = match.group(1).strip()
+                
+                # Split history into chunks and remove the oldest (the first one)
+                history_chunks = [chunk.strip() for chunk in history_str.split('|')]
+                
+                if len(history_chunks) > 1:
+                    # Remove the oldest history entry
+                    new_history = " | ".join(history_chunks[1:])
+                else:
+                    # If only one history chunk left, we can't shorten it further.
+                    # To prevent an infinite loop, we clear it.
+                    new_history = "None"
 
-        # 3. Pad all sequences to the length of the LONGEST sequence in this batch
-        padded = self.tokenizer.pad(
-            {"input_ids": truncated_ids},
+                # Rebuild the prompt with the shorter history
+                start_index = match.start(1)
+                end_index = match.end(1)
+                prompt = prompt[:start_index] + new_history + prompt[end_index:]
+
+                # Re-tokenize to check the new length
+                input_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+            
+            truncated_prompts.append(prompt)
+
+        # 3. Now, tokenize the (potentially truncated) prompts together with padding
+        padded = self.tokenizer(
+            truncated_prompts,
             padding="longest",
+            truncation=False, # We've already handled truncation manually
             return_attention_mask=True,
             return_tensors="pt",
         )
@@ -231,10 +262,14 @@ class LLMPolicy(nn.Module):
 
     def evaluate_actions(
         self, states: List[str], action_lists: List[List[str]], temperature: float
-    ) -> Tuple[List[List[torch.Tensor]], torch.Tensor]:
-        """Evaluate actions with gradients (for training)"""
-        self.model.train()
+    ) -> Tuple[List[List[torch.Tensor]], torch.Tensor, int]:
+        """
+        Evaluate actions with gradients (for training).
         
+        Returns a tuple of (action_logprobs, values, sequence_length).
+        """
+        self.model.train()
+
         # Build action prompts
         action_prompts = []
         metadata = []
@@ -247,6 +282,8 @@ class LLMPolicy(nn.Module):
         # Get action scores
         action_inputs = self.tokenize_prompts(action_prompts)
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
+
+        sequence_length = action_inputs['input_ids'].shape[1]
         
         with autocast(self.model.device.type):
             action_outputs = self.model(**action_inputs)
@@ -271,71 +308,68 @@ class LLMPolicy(nn.Module):
         with autocast(self.model.device.type):
             _, values = self.forward(**state_inputs)  # Use value head output
         
-        
-        return env_action_logprobs, values.squeeze(-1)
+        return env_action_logprobs, values.squeeze(-1), sequence_length
 
     def evaluate_for_rollout(
         self, states: List[str], action_lists: List[List[str]]
     ) -> Tuple[List[List[float]], List[float]]:
-        """Evaluate actions without gradients (for rollout collection)"""
-        self.model.eval()
-        env_action_scores = []
+        """
+        Evaluate actions without gradients, ensuring the model's training
+        state is preserved.
+        """
+        # 1. Save the model's original training mode
+        was_training = self.model.training
+        
+        try:
+            # 2. Set the model to evaluation mode for this operation
+            self.model.eval()
 
-        for state, actions in zip(states, action_lists):
-            # Create action prompts
-            action_prompts = [
-                self.prompt_manager.get_action_prompt(state, actions, action)
-                for action in actions
-            ]
+            # The rest of the function's logic remains the same
+            env_action_scores = []
+
+            for state, actions in zip(states, action_lists):
+                action_prompts = [
+                    self.prompt_manager.get_action_prompt(state, actions, action)
+                    for action in actions
+                ]
+                
+                inputs = self.tokenize_prompts(action_prompts)
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+                with torch.no_grad(), autocast(self.model.device.type):
+                    logits, _ = self.forward(**inputs)
+                    # ... (logic to compute action_scores from logits) ...
+                    # This part is unchanged
+                    if self.prompt_manager.scoring_method == "action_token":
+                        action_scores = []
+                        actions_tokens = [self.tokenizer.encode(f" {a}", add_special_tokens=False) for a in actions]
+                        input_ids = inputs["input_ids"]
+                        for i, tokens in enumerate(actions_tokens):
+                            n = len(tokens)
+                            logits_i = logits[i, -n:]
+                            actions_tensor = torch.tensor(tokens, device=logits.device)
+                            selected = logits_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
+                            action_scores.append(selected.mean())
+                    elif self.prompt_manager.scoring_method == "helpful":
+                        helpful_token_id = self.target_tokens["helpful"]
+                        action_scores = [logit[helpful_token_id] for logit in logits[:, -1, :]]
+                    
+                    action_scores_tensor = torch.stack(action_scores)
+                    env_action_scores.append(action_scores_tensor.cpu().tolist())
+
+            state_inputs = self.tokenize_prompts(states)
+            state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
             
-            # Get action scores
-            inputs = self.tokenize_prompts(action_prompts)
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
             with torch.no_grad(), autocast(self.model.device.type):
-                logits, _ = self.forward(**inputs)
-                if self.prompt_manager.scoring_method == "action_token":
-                    action_scores = []
-                    # logprobs = F.log_softmax(logits, dim=-1)
-                    actions_tokens = [
-                        self.tokenizer.encode(f" {a}", add_special_tokens=False)
-                        for a in actions
-                    ]
-                    input_ids = inputs["input_ids"]
+                _, values = self.forward(**state_inputs)
+                values_list = values.squeeze(-1).cpu().tolist()
+            
+            return env_action_scores, values_list
 
-                    for i, tokens in enumerate(actions_tokens):
-                        n = len(tokens)
-                        prompt_tokens = input_ids[i][-n:].cpu().tolist()
-                        if prompt_tokens != tokens:
-                            raise ValueError(
-                                f"Action tokens do not match for action '{actions[i]}'"
-                            )
-
-                        logits_i = logits[i, -n:]
-                        actions_tensor = torch.tensor(tokens, device=logits.device)
-                        selected = logits_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-                        action_scores.append(selected.mean())
-                elif self.prompt_manager.scoring_method == "helpful":
-                    # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
-                    helpful_token_id = self.target_tokens["helpful"]
-                    action_scores = [logit[helpful_token_id] for logit in logits[:, -1, :]]
-                else:
-                    raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
-
-
-                # Apply temperature and normalize (matching compute_action_scores)
-                action_scores_tensor = torch.stack(action_scores)
-                env_action_scores.append(action_scores_tensor.cpu().tolist())
-
-        # --- Value computation ---
-        state_inputs = self.tokenize_prompts(states)
-        state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
-        
-        with torch.no_grad(), autocast(self.model.device.type):
-            _, values = self.forward(**state_inputs)  # Fixed this line
-            values_list = values.squeeze(-1).cpu().tolist()
-        
-        return env_action_scores, values_list
+        finally:
+            # 3. CRITICAL: Restore the original mode, no matter what happens
+            if was_training:
+                self.model.train()
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates"""

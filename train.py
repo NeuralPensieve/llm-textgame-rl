@@ -1,6 +1,9 @@
 import wandb
 import os
 import argparse
+import random
+import numpy as np
+import torch
 
 from config import PPOConfig
 from trainer import PPOTextWorldTrainer
@@ -8,14 +11,38 @@ from trainer import PPOTextWorldTrainer
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
+def set_seed_and_determinism(seed=42):
+    """
+    Sets the seed for all random number generators and enforces
+    deterministic behavior in PyTorch operations.
+    """
+    # Set seeds for libraries
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # for multi-GPU
+
+    # Configure PyTorch for deterministic operations
+    # This may impact performance, but is necessary for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    print(f"✅ Seeds set to {seed} and deterministic PyTorch operations enabled.")
+
 def main():
     """Main training function"""
+    set_seed_and_determinism(42)
+
     parser = argparse.ArgumentParser(description="PPO TextWorld Training")
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint file")
     args = parser.parse_args()
     
     # Configuration
     config = PPOConfig()
+
+    
 
     print("Using standard PPO training")
     trainer = PPOTextWorldTrainer(config)

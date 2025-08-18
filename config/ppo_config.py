@@ -4,11 +4,11 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Model settings
-    model_name: str = "microsoft/DialoGPT-small"  # Smaller model for RTX 3060
-    # model_name: str = "openai-community/gpt2"
+    # model_name: str = "microsoft/DialoGPT-small"
+    model_name: str = "openai-community/gpt2"
     # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    max_length: int = 512  # Maximum sequence length
+    max_length: int = 1024  # Maximum sequence length
     scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     dynamic_config: bool = False
     debug_mode: bool = False
@@ -16,6 +16,7 @@ class PPOConfig:
 
     # Environment
     num_envs: int = 16
+    num_evals: int = 20
     reuse_seed: bool = False
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
@@ -25,7 +26,7 @@ class PPOConfig:
     history_len: int = 3
 
     # PPO hyperparameters
-    batch_size: int = 4
+    batch_size: int = 2
     accumulation_steps: int = 16
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
@@ -67,4 +68,4 @@ class PPOConfig:
 
     # KL Penalty settings
     use_kl_penalty: bool = True  # ONLY works with action_token
-    reference_fp16: bool = True  # Use FP16 for reference model to save memory
+    reference_fp16: bool = False  # Use FP16 for reference model to save memory
