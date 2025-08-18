@@ -195,7 +195,7 @@ class PPOUpdater:
                         # On the first batch of the first iteration, verify that the KL
                         # between the two models in eval mode is zero. This prevents regressions.
                         if iteration == 0 and epoch == 0 and start == 0:
-                            self.policy.model.eval()
+                            self.policy.eval()
                             with torch.no_grad():
                                 eval_logprobs, _, _ = self.policy.evaluate_actions(
                                     batch_states, batch_action_lists, temperature
@@ -210,7 +210,7 @@ class PPOUpdater:
                             assert torch.allclose(initial_kl, torch.tensor(0.0), atol=1e-6), \
                                 f"Initial KL divergence in eval mode is not zero: {initial_kl.item()}"
                             self.logger.info("✅ Initial KL divergence sanity check passed.")
-                            self.policy.model.train() # Restore train mode
+                            self.policy.train() # Restore train mode
                         # --- END OF SANITY CHECK ---
 
                         # For the actual loss, we calculate KL between the stochastic (train)
@@ -248,7 +248,7 @@ class PPOUpdater:
                     
                     log_prob_diff = current_logprobs - batch_old_logprobs
                     ratio = torch.exp(torch.clamp(log_prob_diff, min=-5, max=5))
-                    
+
                     surr1 = ratio * batch_advantages
                     surr2 = (
                         torch.clamp(

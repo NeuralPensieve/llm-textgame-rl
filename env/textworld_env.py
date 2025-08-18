@@ -10,26 +10,33 @@ from config import PPOConfig
 
 
 class TextWorldEnvironment:
-    """Wrapper for TextWorld environment with enhanced difficulty settings"""
+    """
+    Wrapper for TextWorld environment with conditional logic for repeatable games.
+    - In TRAINING (default): If repeatable=True, games are deterministic and reset to their initial state.
+    - In EVALUATION (is_eval_env=True): Always creates a new random game on init and reset.
+    """
+    _current_seed = None # Shared class variable for deterministic training seeds
 
-    def __init__(self, config: PPOConfig, game_file: str = None):
+    def __init__(self, config: PPOConfig, game_file: str = None, is_eval_env: bool = False):
         self.config = config
+        self.is_eval_env = is_eval_env
+        self.repeatable = config.repeatable
+        
+        # Initialize the shared seed ONLY ONCE for repeatable training environments
+        if self.repeatable and not self.is_eval_env and TextWorldEnvironment._current_seed is None:
+            TextWorldEnvironment._current_seed = config.env_seed if config.env_seed is not None else random.randint(1, 1000000)
         self.max_steps = config.num_steps
         self.current_step = 0
         self.done = False
         self.last_score = 0
         self.game_state = None
         self.step_penalty = config.step_penalty
-        self.base_seed = config.env_seed if config.env_seed is not None else random.randint(1, 1000000)
-        self.seed = self.base_seed
-        self.difficulty = config.difficulty
         self.game_file = game_file
         self.temp_dir = None
         self.temp_game_file = None
-        self.repeatable = config.repeatable
-        self.gamma = config.gamma
         self.history_len = config.history_len
         self.history = deque(maxlen=self.history_len)
+        self.seed = None # Will be set during game creation
 
         request_infos = self._get_request_infos()
         if game_file:
@@ -65,31 +72,29 @@ class TextWorldEnvironment:
             except:
                 pass
         
-        self.temp_game_file = None
-        self.temp_dir = None
+        self.temp_game_file, self.temp_dir = None, None
 
     def _create_simple_game(self):
         """Create a TextWorld game with configurable difficulty in memory"""
         self._cleanup_temp_files()
-        self.seed = random.randint(1, 1000000)
+
+        # Determine the seed based on the environment's purpose
+        if self.is_eval_env or not self.repeatable:
+            self.seed = random.randint(1, 1000000)
+        else: # This is a repeatable training environment
+            TextWorldEnvironment._current_seed += 1
+            self.seed = TextWorldEnvironment._current_seed
         options = textworld.GameOptions()
         options.seeds = self.seed
         
-        if self.difficulty == "easy":
-            options.nb_rooms = 2
-            options.nb_objects = 4
-        elif self.difficulty == "medium":
-            options.nb_rooms = 3
-            options.nb_objects = 4
-            options.quest_length = 3
-        elif self.difficulty == "hard":
-            options.nb_rooms = 6
-            options.nb_objects = 6
-            options.quest_length = 5
+        if self.config.difficulty == "easy":
+            options.nb_rooms, options.nb_objects = 2, 4
+        elif self.config.difficulty == "medium":
+            options.nb_rooms, options.nb_objects, options.quest_length = 3, 4, 3
+        elif self.config.difficulty == "hard":
+            options.nb_rooms, options.nb_objects, options.quest_length = 6, 6, 5
         else:
-            options.nb_rooms = 3
-            options.nb_objects = 4
-            options.quest_length = 3
+            options.nb_rooms, options.nb_objects, options.quest_length = 3, 4, 3
             
         options.theme = "house"
         
@@ -101,52 +106,25 @@ class TextWorldEnvironment:
         # Create the game
         game_file, _ = textworld.make(options)
             
-        request_infos = self._get_request_infos()
-
-        env = textworld.start(game_file, request_infos=request_infos)
-        return env
-
-    def set_difficulty(self, difficulty: str):
-        """Change difficulty and recreate the game"""
-        self.difficulty = difficulty
-        if hasattr(self.env, 'close'):
-            self.env.close()
-        self._cleanup_temp_files()
-        self.env = self._create_simple_game()
+        return textworld.start(game_file, request_infos=self._get_request_infos())
 
     def reset(self):
         """
         Reset environment. If repeatable, reset the same game. 
         Otherwise, create a new game instance. Returns the initial state dictionary.
         """
-        self.current_step = 0
-        self.done = False
-        self.last_score = 0
-        self.history.clear() # Clear history on every reset
+        self.current_step, self.done, self.last_score = 0, False, 0
+        self.history.clear()
 
-        # If repeatable is True, just reset the existing game to its initial state
-        if self.repeatable and hasattr(self, 'env') and self.env is not None:
-            self.game_state = self.env.reset()
-            return self._extract_state(self.game_state)
+        # Hard reset for evaluation envs or non-repeatable training envs
+        if self.is_eval_env or not self.repeatable:
+            if hasattr(self, 'env') and self.env is not None:
+                self.env.close()
+            self._cleanup_temp_files()
+            self.env = self._create_simple_game()
         
-        # --- If not repeatable, create a new game ---
-        
-        # Close existing environment if it exists
-        if hasattr(self, 'env') and self.env is not None:
-            self.env.close()
-        
-        # Clean up old temporary files before creating new ones
-        self._cleanup_temp_files()
-        
-        # Create a new environment instance
-        if self.game_file:
-            self.env = textworld.start(self.game_file, request_infos=self._get_request_infos())
-        else:
-            self.env = self._create_simple_game() # Creates a new game with a new seed
-
-        # Reset the game state with the new environment
+        # For both hard and soft resets, we need to call the underlying env's reset
         self.game_state = self.env.reset()
-
         return self._extract_state(self.game_state)
 
     def step(self, action: str):
@@ -155,8 +133,7 @@ class TextWorldEnvironment:
 
         # This will be used to populate the history
         if self.game_state:
-            previous_state_description = self.game_state.description
-            self.history.append((previous_state_description, action))
+            self.history.append((self.game_state.description, action))
 
         # Send command to the game and get the new game state
         self.game_state, score, done = self.env.step(action)
@@ -184,14 +161,10 @@ class TextWorldEnvironment:
         """Get list of valid actions from the current game state"""
         if self.game_state:
             return self.game_state.get("admissible_commands", [])
-        else:
-            raise ValueError(f'No valid actions. Game state is {self.game_state}')
+        raise ValueError(f'No valid actions. Game state is {self.game_state}')
         
     def _build_concise_state(self, game_state) -> str:
         """Builds a compact state string from structured game info."""
-        
-        # +++ ROBUSTNESS FIX +++
-        # Check if infos is populated. If not, fall back to the raw description.
         if game_state.infos is None:
             return self._clean_text(game_state.description)
 
@@ -217,74 +190,41 @@ class TextWorldEnvironment:
         return f"{location_name}. {objects_str}. {exits_str}"
 
     def _extract_state(self, game_state):
-        """
-        Gathers all state information into a dictionary and formats it as text.
-        """
-        if not game_state:
-            raise ValueError("Invalid game state provided.")
-
-        objective = self.clean_objective(game_state.get("objective", "No objective specified."))
-        
-        if self.history:
-            previous_state_actions = [item for pair in self.history for item in pair]
-        else:
-            previous_state_actions = None
-        
-        current_state = self._build_concise_state(game_state)
-        inventory = self._clean_text(game_state.get("inventory", "You are carrying nothing."))
-        available_actions = game_state.get("admissible_commands", [])
-        
+        """Gathers all state information and formats it as text."""
+        if not game_state: raise ValueError("Invalid game state provided.")
         state_dict = {
-            "objective": objective,
-            "previous state actions": previous_state_actions,
-            "current state": current_state,
-            "inventory": inventory,
-            "available actions": available_actions
+            "objective": self.clean_objective(game_state.get("objective", "No objective specified.")),
+            "previous state actions": [item for pair in self.history for item in pair] if self.history else None,
+            "current state": self._build_concise_state(game_state),
+            "inventory": self._clean_text(game_state.get("inventory", "You are carrying nothing.")),
+            "available actions": game_state.get("admissible_commands", [])
         }
-        
-        # Convert the dictionary to the final text format
         return self._format_state_as_text(state_dict)
 
     def _format_state_as_text(self, state_dict: dict) -> str:
-        """
-        Converts the state dictionary into a compact, delimited string,
-        grouping consecutive actions that occur in the same state.
-        """
+        """Converts the state dictionary into a compact, delimited string."""
         history_list = state_dict["previous state actions"]
+        history_str = "None"
         if history_list:
-            history_parts = []
-            last_state = None
-            # Iterate over the list in pairs of (state, action)
+            history_parts, last_state = [], None
             for i in range(0, len(history_list), 2):
                 state = self._clean_text(history_list[i]).replace("\n", " ")
                 action = history_list[i+1]
-                
-                # If the state is new, add it. Otherwise, just append the action.
                 if state != last_state:
-                    if last_state is not None:
-                        history_parts.append(" | ") # Add separator between different state blocks
+                    if last_state is not None: history_parts.append(" | ")
                     history_parts.append(f"{state} > {action}")
                 else:
                     history_parts.append(f" > {action}")
-
                 last_state = state
             history_str = "".join(history_parts)
-        else:
-            history_str = "None"
-
-        # Format available actions
         actions_str = " | ".join(state_dict["available actions"])
-
-        # Assemble the final string
-        formatted_text = (
+        return (
             f"OBJECTIVE: {state_dict['objective']}\n"
             f"HISTORY: {history_str}\n"
             f"STATE: {state_dict['current state']}\n"
             f"INVENTORY: {state_dict['inventory']}\n"
             f"ACTIONS: {actions_str}"
         )
-        
-        return formatted_text
 
     def _clean_text(self, text: str) -> str:
         """Remove ASCII art, banners, and ANSI codes. Normalize spaces and newlines."""

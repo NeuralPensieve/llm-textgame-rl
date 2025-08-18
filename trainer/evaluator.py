@@ -43,7 +43,7 @@ class Evaluator:
         num_sample_games = min(self.num_envs, 5)
 
         # --- Initialization ---
-        envs = [TextWorldEnvironment(config=self.config) for _ in range(self.num_envs)]
+        envs = [TextWorldEnvironment(config=self.config, is_eval_env=True) for _ in range(self.num_envs)]
         states = [env.reset() for env in envs]
 
         # A mask to track which environments are still running.
@@ -81,8 +81,10 @@ class Evaluator:
                         done = True
                         info = {} # Ensure info dict exists
                     else:
-                        scores = np.array(action_scores[i])
-                        action_idx = np.argmax(scores)
+                        # scores = np.array(action_scores[i])
+                        # action_idx = np.argmax(scores)
+                        scores = action_scores[i]
+                        action_idx, _ = self.temperature_sampling(scores, temperature=1.0) 
                         chosen_action = batch_actions[i][action_idx]
 
                         # Log details for sample games if this is a logging-enabled slot.
@@ -161,3 +163,43 @@ class Evaluator:
         torch.cuda.empty_cache()
 
         return avg_episode_length, avg_episode_reward
+    
+    def temperature_sampling(self, raw_scores, temperature: float) -> Tuple[int, float]:
+        """
+        Apply temperature sampling to raw action scores with numerical stability.
+        
+        Args:
+            raw_scores: Raw action scores (logits) from the policy.
+            temperature: Temperature parameter for sampling.
+        
+        Returns:
+            action_idx: The selected action index.
+            old_logprob: The log probability of the selected action from the original policy.
+        """
+        scores = np.array(raw_scores)
+
+        # Prevent errors on empty scores list
+        if not scores.any():
+            return 0, -np.inf
+        
+        # Apply temperature for sampling distribution
+        scaled_scores = scores / temperature
+        
+        # Create sampling probabilities with numerical stability
+        # Subtracting the max score prevents overflow when exponentiating
+        scaled_scores_stable = scaled_scores - np.max(scaled_scores)
+        sampling_probs = np.exp(scaled_scores_stable) / np.sum(np.exp(scaled_scores_stable))
+
+        # Sample an action from the modified distribution
+        action_idx = np.random.choice(len(sampling_probs), p=sampling_probs)
+        
+        # Now, calculate the log probability from the ORIGINAL, non-scaled scores
+        # This is the log-softmax function, also with a stability trick
+        original_scores_stable = scores - np.max(scores)
+        exp_scores = np.exp(original_scores_stable)
+        log_sum_exp = np.log(np.sum(exp_scores))
+        original_logprobs = original_scores_stable - log_sum_exp
+        
+        old_logprob = original_logprobs[action_idx]
+        
+        return action_idx, old_logprob

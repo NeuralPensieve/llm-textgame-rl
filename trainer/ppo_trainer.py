@@ -105,6 +105,20 @@ class PPOTextWorldTrainer(BaseTrainer):
             avg_episode_reward = np.mean(episode_rewards)
             total_episode_reward = np.sum(episode_rewards)
 
+            # Log iteration metrics
+            wandb.log(
+                {
+                    "iteration": iteration,
+                    "avg_reward": avg_reward,
+                    "avg_episode_length": avg_episode_length,
+                    "avg_episode_reward": avg_episode_reward,
+                    "total_episode_reward": total_episode_reward,
+                    "total_experiences": len(rollout_buffer),
+                    "epsilon": self.epsilon,
+                    "temperature": self.temperature,
+                }
+            )
+
             # Update policy
             self.ppo_updater.ppo_update(rollout_buffer, iteration, self.temperature)
 
@@ -132,13 +146,6 @@ class PPOTextWorldTrainer(BaseTrainer):
             wandb.log(
                 {
                     "iteration": iteration,
-                    "avg_reward": avg_reward,
-                    "avg_episode_length": avg_episode_length,
-                    "avg_episode_reward": avg_episode_reward,
-                    "total_episode_reward": total_episode_reward,
-                    "total_experiences": len(rollout_buffer),
-                    "epsilon": self.epsilon,
-                    "temperature": self.temperature,
                     "iteration_duration": iteration_duration,
                     "normalized_iteration_duration": normalized_duration,
                 }

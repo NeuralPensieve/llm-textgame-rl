@@ -74,34 +74,6 @@ class LLMPolicy(nn.Module):
         
         self._cache_target_tokens()
 
-        # if config.use_kl_penalty:
-        #     self.logger.info("Running model identity sanity check...")
-        #     with torch.no_grad():
-        #         # Set both models to eval mode for a deterministic comparison.
-        #         self.model.eval()
-                
-        #         dummy_input = self.tokenizer("hello world", return_tensors="pt").to(self.model.device)
-                
-        #         # Perform a direct, identical forward pass on both base models.
-        #         main_outputs = self.model(**dummy_input)
-        #         ref_outputs = self.reference_model(**dummy_input)
-                
-        #         # Assert that their logits are close, accounting for potential dtype differences.
-        #         assert torch.allclose(
-        #             main_outputs.logits.float(), 
-        #             ref_outputs.logits.float(), 
-        #             atol=1e-3
-        #         ), "Model and reference model outputs do not match after initialization!"
-                
-        #         self.logger.info("✅ Sanity check passed: Models are identical.")
-
-        #         # Optionally convert the reference model to FP16 to save memory.
-        #         if config.reference_fp16:
-        #             self.reference_model = self.reference_model.half()
-                
-        #         # IMPORTANT: Set the main model back to train mode for PPO updates.
-        #         self.model.train()
-
     def _cache_target_tokens(self):
         """Cache target token IDs for 'helpful' scoring"""
         self.target_tokens = {}
@@ -236,7 +208,7 @@ class LLMPolicy(nn.Module):
         
         Returns a tuple of (action_logprobs, values, sequence_length).
         """
-        # self.model.train()
+        # self.model.train()   # This was the Heisenberg bug
 
         # Build action prompts
         action_prompts = []
@@ -296,11 +268,11 @@ class LLMPolicy(nn.Module):
         state is preserved.
         """
         # 1. Save the model's original training mode
-        was_training = self.model.training
+        was_training = self.training
         
         try:
             # 2. Set the model to evaluation mode for this operation
-            self.model.eval()
+            self.eval()
 
             # The rest of the function's logic remains the same
             env_action_scores = []
@@ -346,7 +318,7 @@ class LLMPolicy(nn.Module):
         finally:
             # 3. CRITICAL: Restore the original mode, no matter what happens
             if was_training:
-                self.model.train()
+                self.train()
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates"""

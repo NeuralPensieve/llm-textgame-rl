@@ -44,7 +44,7 @@ def set_seed_and_determinism(seed=42):
 
 def main():
     """Main training function"""
-    set_seed_and_determinism(42)
+    # set_seed_and_determinism(42)
 
     parser = argparse.ArgumentParser(description="PPO TextWorld Training")
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint file")

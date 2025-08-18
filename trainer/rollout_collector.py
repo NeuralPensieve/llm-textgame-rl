@@ -86,6 +86,13 @@ class RolloutCollector:
             
             states = new_states
 
+        # IMPORTANT FIX: Add any remaining incomplete episodes to the statistics
+        # This ensures consistency with the evaluator which counts all episodes
+        for i in range(len(self.envs)):
+            if episode_lengths[i] > 0:  # This environment has an incomplete episode
+                all_episode_rewards.append(episode_rewards[i])
+                all_episode_lengths.append(episode_lengths[i])
+    
         return rollout_buffer, all_episode_lengths, all_episode_rewards
     
     def temperature_sampling(self, raw_scores, temperature: float) -> Tuple[int, float]:
