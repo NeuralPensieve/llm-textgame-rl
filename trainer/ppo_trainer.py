@@ -71,35 +71,6 @@ class PPOTextWorldTrainer(BaseTrainer):
         )
         # torch.cuda.empty_cache()
 
-        # --- ADD THIS DEBUG BLOCK AT THE END OF __init__ ---
-        self.logger.info("\n--- RUNNING PRE-TRAINING MODEL IDENTITY CHECK ---")
-        # Create a simple, repeatable dummy input
-        dummy_prompts = ["What is the capital of Washington state?"]
-        inputs = self.policy.tokenize_prompts(dummy_prompts)
-        inputs_on_device = {k: v.to(self.policy.model.device) for k, v in inputs.items()}
-        
-        # Set main model to eval mode for a clean comparison
-        self.policy.model.eval()
-
-        with torch.no_grad():
-            # Get raw logits from both models
-            main_logits = self.policy.model(**inputs_on_device).logits.float()
-            ref_logits = self.policy.reference_model(**inputs_on_device).logits.float()
-
-            # Perform a direct comparison
-            max_diff = torch.abs(main_logits - ref_logits).max().item()
-            are_close = torch.allclose(main_logits, ref_logits)
-            
-            self.logger.info(f"Max absolute difference in logits at initialization: {max_diff:.8f}")
-            if are_close:
-                self.logger.info("✅ SUCCESS: Models are identical immediately after initialization.")
-            else:
-                self.logger.error("❌ FAILURE: Models are DIVERGENT immediately after initialization.")
-        
-        # Restore main model to train mode before the training loop begins
-        self.policy.model.train()
-        self.logger.info("--- FINISHED PRE-TRAINING CHECK ---\n")
-        # --- END DEBUG BLOCK ---
 
     def train(self):
         """Main training loop"""

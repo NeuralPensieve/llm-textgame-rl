@@ -108,30 +108,12 @@ class PPOUpdater:
 
         self.log_value_function_diagnostics(rollout_buffer, iteration)
 
-        # Existing validation
-        if self.config.debug_mode:
-            ranking_results = self.validate_value_function_ranking(rollout_buffer)
-            wandb.log({
-                "value_diagnostics/ranking_accuracy": ranking_results["ranking_accuracy"],
-                "iteration": iteration
-            })
-
         # Convert to tensors
         advantages = torch.FloatTensor(advantages).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
         old_logprobs = torch.FloatTensor(
             [exp["old_logprob"] for exp in rollout_buffer]
         ).to(self.device)
-
-        if self.config.debug_mode:
-            # Get first batch for debugging
-            batch_experiences = rollout_buffer[:self.config.batch_size]
-            
-            # DEBUG: Compare scoring methods (only on first iteration)
-            if iteration == 0:
-                # debug_results = self.debug_action_scoring_comparison(batch_experiences)
-                # self.logger.info(f"Debug results: {debug_results}")
-                self.debug_action_scoring_detailed(batch_experiences, temperature)
 
         # ADVANTAGE TRACKING: Compute advantage statistics
         advantage_stats = {
@@ -178,114 +160,6 @@ class PPOUpdater:
                 end = start + effective_batch_size
                 batch_indices = indices[start:end]
 
-                # --- ADD THIS FINAL DEBUG BLOCK ---
-                if iteration == 0 and epoch == 0 and start == 0:
-                    self.logger.info("\n--- STARTING DIRECT FORWARD PASS COMPARISON ---")
-                    
-                    # 1. Manually prepare the exact inputs that will be used
-                    batch_experiences = [rollout_buffer[i] for i in batch_indices]
-                    batch_states = [exp["state"] for exp in batch_experiences]
-                    batch_action_lists = [exp["available_actions"] for exp in batch_experiences]
-
-                    prompts = []
-                    for i, (state, actions) in enumerate(zip(batch_states, batch_action_lists)):
-                        for action in actions:
-                            prompt = self.policy.prompt_manager.get_action_prompt(state, actions, action)
-                            prompts.append(prompt)
-                    
-                    # 2. Tokenize ONCE to get a single, definitive input tensor
-                    inputs = self.policy.tokenize_prompts(prompts)
-                    inputs_on_device = {k: v.to(self.policy.model.device) for k, v in inputs.items()}
-                    
-                    # 3. Get logits from both models in EVAL mode using the SAME input tensor
-                    self.policy.model.eval()
-                    with torch.no_grad():
-                        # --- Main Model Pass (with autocast) ---
-                        with torch.amp.autocast(self.device.type):
-                            main_outputs_ac = self.policy.model(**inputs_on_device)
-                        main_logits_ac = main_outputs_ac.logits.float()
-
-                        # --- Reference Model Pass (with autocast) ---
-                        with torch.amp.autocast(self.device.type):
-                            ref_outputs_ac = self.policy.reference_model(**inputs_on_device)
-                        ref_logits_ac = ref_outputs_ac.logits.float()
-
-                        # --- Main Model Pass (WITHOUT autocast) ---
-                        main_outputs_fp32 = self.policy.model(**inputs_on_device)
-                        main_logits_fp32 = main_outputs_fp32.logits.float()
-
-                        # --- Reference Model Pass (WITHOUT autocast) ---
-                        ref_outputs_fp32 = self.policy.reference_model(**inputs_on_device)
-                        ref_logits_fp32 = ref_outputs_fp32.logits.float()
-
-                    # 4. Perform the crucial comparisons
-                    self.logger.info("\n--- COMPARISON WITH AUTOCAST (FP16/BF16) ---")
-                    ac_diff = torch.abs(main_logits_ac - ref_logits_ac).max().item()
-                    self.logger.info(f"  Max absolute logit difference: {ac_diff:.8f}")
-                    self.logger.info(f"  Are logits close? {torch.allclose(main_logits_ac, ref_logits_ac)}")
-
-                    self.logger.info("\n--- COMPARISON WITHOUT AUTOCAST (FP32) ---")
-                    fp32_diff = torch.abs(main_logits_fp32 - ref_logits_fp32).max().item()
-                    self.logger.info(f"  Max absolute logit difference: {fp32_diff:.8f}")
-                    self.logger.info(f"  Are logits close? {torch.allclose(main_logits_fp32, ref_logits_fp32)}")
-                    
-                    self.policy.model.train() # Restore mode
-                    self.logger.info("\n--- FINISHED DIRECT COMPARISON ---\n")
-
-                    self.logger.info("\n--- TESTING TRAIN VS. EVAL HYPOTHESIS ---")
-    
-                    # Use the exact same batch data for all tests
-                    batch_experiences_test = [rollout_buffer[i] for i in batch_indices]
-                    batch_states_test = [exp["state"] for exp in batch_experiences_test]
-                    batch_action_lists_test = [exp["available_actions"] for exp in batch_experiences_test]
-
-                    with torch.no_grad():
-                        # 1. Get baseline logprobs from the reference model (NO gradient checkpointing).
-                        reference_logprobs = self.policy.get_reference_action_scores(
-                            batch_states_test, batch_action_lists_test, temperature
-                        )
-
-                        # 2. Get logprobs from the main model in eval mode but WITH its default gradient checkpointing.
-                        self.policy.model.eval()
-                        current_logprobs_with_gc, _, _ = self.policy.evaluate_actions(
-                            batch_states_test, batch_action_lists_test, temperature
-                        )
-                        kl_div_with_gc = self.policy.compute_kl_divergence(
-                            current_logprobs_with_gc, reference_logprobs
-                        ).item()
-                        self.logger.info(f"  KL (Main Model Eval, WITH GC): {kl_div_with_gc:.6f} <-- The persistent high value.")
-
-                        # 3. CRITICAL TEST: Disable gradient checkpointing on the main model and re-calculate.
-                        # Store the original state to restore it later
-                        was_checkpointing = self.policy.model.is_gradient_checkpointing
-                        if was_checkpointing:
-                            self.policy.model.gradient_checkpointing_disable()
-                        
-                        # Ensure it's still in eval mode for a fair comparison
-                        self.policy.model.eval() 
-                        current_logprobs_without_gc, _, _ = self.policy.evaluate_actions(
-                            batch_states_test, batch_action_lists_test, temperature
-                        )
-                        
-                        # IMPORTANT: Restore the model's original settings for training
-                        if was_checkpointing:
-                            self.policy.model.gradient_checkpointing_enable()
-                        self.policy.model.train()
-
-                        kl_div_without_gc = self.policy.compute_kl_divergence(
-                            current_logprobs_without_gc, reference_logprobs
-                        ).item()
-                        self.logger.info(f"  KL (Main Model Eval, WITHOUT GC): {kl_div_without_gc:.6f} <-- The expected near-zero value.")
-
-                        # 4. Assert the new hypothesis.
-                        if abs(kl_div_without_gc) < 1e-5:
-                            self.logger.info("  ✅ HYPOTHESIS CONFIRMED: Disabling gradient checkpointing resolves the discrepancy.")
-                        else:
-                            self.logger.error("  ❌ HYPOTHESIS REJECTED: The cause is even more subtle.")
-                            
-                    self.logger.info("--- END OF HYPOTHESIS TEST ---\n")
-                # --- END OF BLOCK ---
-
                 # Get batch data
                 batch_experiences = [rollout_buffer[i] for i in batch_indices]
                 batch_advantages = advantages[batch_indices]
@@ -317,7 +191,30 @@ class PPOUpdater:
                     # Compute KL divergence if enabled
                     kl_div = torch.tensor(0.0, device=self.device)
                     if self.config.use_kl_penalty:
-                        # Get reference model's action scores
+                        # --- PERMANENT SANITY CHECK ---
+                        # On the first batch of the first iteration, verify that the KL
+                        # between the two models in eval mode is zero. This prevents regressions.
+                        if iteration == 0 and epoch == 0 and start == 0:
+                            self.policy.model.eval()
+                            with torch.no_grad():
+                                eval_logprobs, _, _ = self.policy.evaluate_actions(
+                                    batch_states, batch_action_lists, temperature
+                                )
+                                ref_logprobs = self.policy.get_reference_action_scores(
+                                    batch_states, batch_action_lists, temperature
+                                )
+                                initial_kl = self.policy.compute_kl_divergence(
+                                    eval_logprobs, ref_logprobs
+                                )
+                            # Allow for a tiny tolerance for floating point artifacts
+                            assert torch.allclose(initial_kl, torch.tensor(0.0), atol=1e-6), \
+                                f"Initial KL divergence in eval mode is not zero: {initial_kl.item()}"
+                            self.logger.info("✅ Initial KL divergence sanity check passed.")
+                            self.policy.model.train() # Restore train mode
+                        # --- END OF SANITY CHECK ---
+
+                        # For the actual loss, we calculate KL between the stochastic (train)
+                        # policy and the deterministic (eval) reference policy.
                         reference_action_logprobs = self.policy.get_reference_action_scores(
                             batch_states, batch_action_lists, temperature
                         )
@@ -327,28 +224,6 @@ class PPOUpdater:
                             current_action_logprobs,
                             reference_action_logprobs
                         )
-
-                        # --- ADD THIS DEBUG CODE ---
-                        if iteration == 0 and epoch == 0 and start == 0:
-                            self.logger.info(f"DEBUG: Initial KL (model in train mode): {kl_div.item():.6f}")
-
-                            # Temporarily switch model to eval mode to disable dropout
-                            self.policy.model.eval()
-                            with torch.no_grad(): # no_grad to be safe, though eval is the key
-                                # Re-evaluate the current policy's logprobs
-                                debug_current_logprobs, _, _ = self.policy.evaluate_actions(
-                                    batch_states, batch_action_lists, temperature
-                                )
-                                # Re-compute KL with the deterministic model
-                                debug_kl_div = self.policy.compute_kl_divergence(
-                                    debug_current_logprobs,
-                                    reference_action_logprobs
-                                )
-                                self.logger.info(f"DEBUG: Initial KL (model in eval mode): {debug_kl_div.item():.6f}")
-                            
-                            # IMPORTANT: Switch model back to train mode
-                            self.policy.model.train()
-                        # -------------------------
                         
                         epoch_kl_values.append(kl_div.item())
 
@@ -372,9 +247,7 @@ class PPOUpdater:
                     current_values = current_values.view(-1)
                     
                     log_prob_diff = current_logprobs - batch_old_logprobs
-                    log_prob_diff = torch.clamp(log_prob_diff, min=-5, max=5)
-
-                    ratio = torch.exp(log_prob_diff)
+                    ratio = torch.exp(torch.clamp(log_prob_diff, min=-5, max=5))
                     
                     surr1 = ratio * batch_advantages
                     surr2 = (

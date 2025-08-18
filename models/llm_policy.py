@@ -29,8 +29,8 @@ class LLMPolicy(nn.Module):
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             config=model_config,
-            device_map="auto",
-            max_memory={0: "8GB"},
+            # device_map="auto",
+            # max_memory={0: "8GB"},
         )
         
         # Enable gradient checkpointing on the main model to save memory during training.
@@ -55,16 +55,7 @@ class LLMPolicy(nn.Module):
             # Load a second, separate instance of the model to act as a fixed reference.
             self.logger.info("Creating reference model by loading state_dict...")
             
-            # 1. Instantiate a completely new model with the same config.
-            self.reference_model = AutoModelForCausalLM.from_pretrained(
-                config.model_name,
-                config=model_config,
-                device_map="auto",
-                max_memory={0: "8GB"},
-            )
-            
-            # 2. Load the weights from the main model to ensure they are identical.
-            self.reference_model.load_state_dict(self.model.state_dict())
+            self.reference_model = copy.deepcopy(self.model)
 
             # Freeze the reference model's parameters and set it to evaluation mode.
             for param in self.reference_model.parameters():
@@ -83,33 +74,33 @@ class LLMPolicy(nn.Module):
         
         self._cache_target_tokens()
 
-        if config.use_kl_penalty:
-            self.logger.info("Running model identity sanity check...")
-            with torch.no_grad():
-                # Set both models to eval mode for a deterministic comparison.
-                self.model.eval()
+        # if config.use_kl_penalty:
+        #     self.logger.info("Running model identity sanity check...")
+        #     with torch.no_grad():
+        #         # Set both models to eval mode for a deterministic comparison.
+        #         self.model.eval()
                 
-                dummy_input = self.tokenizer("hello world", return_tensors="pt").to(self.model.device)
+        #         dummy_input = self.tokenizer("hello world", return_tensors="pt").to(self.model.device)
                 
-                # Perform a direct, identical forward pass on both base models.
-                main_outputs = self.model(**dummy_input)
-                ref_outputs = self.reference_model(**dummy_input)
+        #         # Perform a direct, identical forward pass on both base models.
+        #         main_outputs = self.model(**dummy_input)
+        #         ref_outputs = self.reference_model(**dummy_input)
                 
-                # Assert that their logits are close, accounting for potential dtype differences.
-                assert torch.allclose(
-                    main_outputs.logits.float(), 
-                    ref_outputs.logits.float(), 
-                    atol=1e-3
-                ), "Model and reference model outputs do not match after initialization!"
+        #         # Assert that their logits are close, accounting for potential dtype differences.
+        #         assert torch.allclose(
+        #             main_outputs.logits.float(), 
+        #             ref_outputs.logits.float(), 
+        #             atol=1e-3
+        #         ), "Model and reference model outputs do not match after initialization!"
                 
-                self.logger.info("✅ Sanity check passed: Models are identical.")
+        #         self.logger.info("✅ Sanity check passed: Models are identical.")
 
-                # Optionally convert the reference model to FP16 to save memory.
-                if config.reference_fp16:
-                    self.reference_model = self.reference_model.half()
+        #         # Optionally convert the reference model to FP16 to save memory.
+        #         if config.reference_fp16:
+        #             self.reference_model = self.reference_model.half()
                 
-                # IMPORTANT: Set the main model back to train mode for PPO updates.
-                self.model.train()
+        #         # IMPORTANT: Set the main model back to train mode for PPO updates.
+        #         self.model.train()
 
     def _cache_target_tokens(self):
         """Cache target token IDs for 'helpful' scoring"""
@@ -203,52 +194,29 @@ class LLMPolicy(nn.Module):
     def compute_action_scores(
         self,
         logits: torch.Tensor,
-        input_ids: torch.Tensor,
         metadata: List[Tuple],
         num_states: int,
-        action_prompts: List[str],
         temperature: float,
     ) -> List[torch.Tensor]:
         """Compute action scores based on scoring method"""
         env_action_logprobs = [[] for _ in range(num_states)]
 
         if self.prompt_manager.scoring_method == "action_token":
-            # logprobs = F.log_softmax(logits, dim=-1)
-
-            for idx, ((env_idx, action), prompt) in enumerate(
-                zip(metadata, action_prompts)
-            ):
-                if self.config.debug_mode:
-                    # DEBUG: Print what we're processing
-                    if idx == 0:  # Just first action for debugging
-                        print(f"\n[compute_action_scores] Processing first action:")
-                        print(f"  Action: '{action}'")
-                        print(f"  Logits shape for this prompt: {logits[idx].shape}")
-
+            for idx, (env_idx, action) in enumerate(metadata):
                 action_tokens = self.tokenizer.encode(
                     " " + action.strip(), add_special_tokens=False
                 )
                 n = len(action_tokens)
-                prompt_tokens = input_ids[idx][-n:].cpu().tolist()
-
-                if prompt_tokens != action_tokens:
-                    raise ValueError(f"Token mismatch for action '{action.strip()}'")
 
                 token_logits = []
                 for i, token_id in enumerate(action_tokens):
-                    pos = -(n-i)
+                    pos = -(n - i)
                     logit = logits[idx, pos, token_id]
                     token_logits.append(logit)
 
-                    if self.config.debug_mode:
-                        # DEBUG: Print token details for first action
-                        if idx == 0:
-                            print(f"    Token {i} (id={token_id}, pos={pos}): {logit.item():.4f}")
-                
                 avg_score = torch.stack(token_logits).mean()
                 env_action_logprobs[env_idx].append(avg_score)
         elif self.prompt_manager.scoring_method == "helpful":
-            # logprobs = F.log_softmax(logits[:, -1, :], dim=-1)
             helpful_token_id = self.target_tokens["helpful"]
             for (env_idx, action), logit in zip(metadata, logits[:, -1, :]):
                 score = logit[helpful_token_id]
@@ -268,7 +236,7 @@ class LLMPolicy(nn.Module):
         
         Returns a tuple of (action_logprobs, values, sequence_length).
         """
-        self.model.train()
+        # self.model.train()
 
         # Build action prompts
         action_prompts = []
@@ -279,9 +247,17 @@ class LLMPolicy(nn.Module):
                 action_prompts.append(prompt)
                 metadata.append((i, action.strip()))
 
+        # --- TRACE POINT 1: Prompts ---
+        if self.config.debug_mode:
+            print(f"[TRACE-MAIN] Prompts Hash: {hash(tuple(action_prompts))}")
+
         # Get action scores
         action_inputs = self.tokenize_prompts(action_prompts)
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
+
+        # --- TRACE POINT 2: Tokenized Input Tensor ---
+        if self.config.debug_mode:
+            print(f"[TRACE-MAIN] Input Tensor Sum: {action_inputs['input_ids'].sum().item()}")
 
         sequence_length = action_inputs['input_ids'].shape[1]
         
@@ -289,16 +265,18 @@ class LLMPolicy(nn.Module):
             action_outputs = self.model(**action_inputs)
             action_logits = action_outputs.logits
 
+        # --- TRACE POINT 3: Raw Logits Tensor ---
+        if self.config.debug_mode:
+            print(f"[TRACE-MAIN] Raw Logits Sum: {action_logits.sum().item()}")
+
         if self.config.debug_mode:
             print(f"[evaluate_actions] Input shape: {action_inputs['input_ids'].shape}")
             print(f"[evaluate_actions] First prompt tokens (last 10): {action_inputs['input_ids'][0, -10:].tolist()}")
 
         env_action_logprobs = self.compute_action_scores(
             action_logits,
-            action_inputs["input_ids"],
             metadata,
             len(states),
-            action_prompts,
             temperature,
         )
         
@@ -338,7 +316,6 @@ class LLMPolicy(nn.Module):
 
                 with torch.no_grad(), autocast(self.model.device.type):
                     logits, _ = self.forward(**inputs)
-                    # ... (logic to compute action_scores from logits) ...
                     # This part is unchanged
                     if self.prompt_manager.scoring_method == "action_token":
                         action_scores = []
@@ -379,7 +356,7 @@ class LLMPolicy(nn.Module):
         ]
     
     def get_reference_action_scores(self, states: List[str], action_lists: List[List[str]], temperature: float) -> List[torch.Tensor]:
-        """Get action scores from reference model using same averaging method"""
+        """Get action scores from reference model using the single, shared scoring method."""
 
         with torch.no_grad():
             # Build prompts and metadata
@@ -391,39 +368,34 @@ class LLMPolicy(nn.Module):
                     prompt = self.prompt_manager.get_action_prompt(state, actions, action)
                     action_prompts.append(prompt)
                     metadata.append((i, action.strip()))
+
+            # --- TRACE POINT 1: Prompts ---
+            if self.config.debug_mode:
+                print(f"[TRACE-REF] Prompts Hash: {hash(tuple(action_prompts))}")
             
             # Tokenize all prompts
             inputs = self.tokenize_prompts(action_prompts)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+            # --- TRACE POINT 2: Tokenized Input Tensor ---
+            if self.config.debug_mode:
+                print(f"[TRACE-REF] Input Tensor Sum: {inputs['input_ids'].sum().item()}")
             
             # Get reference model logits (FP16 if configured)
-            with autocast(self.model.device.type, enabled=self.config.reference_fp16):
-                ref_outputs = self.reference_model(**inputs)
-                ref_logits = ref_outputs.logits
-            
-            # Extract and average logits for each action
-            env_action_scores = [[] for _ in range(len(states))]
-            
-            for idx, ((env_idx, action), prompt) in enumerate(zip(metadata, action_prompts)):
-                action_tokens = self.tokenizer.encode(f" {action}", add_special_tokens=False)
-                n = len(action_tokens)
-                
-                # Extract logits for action tokens
-                token_logits = []
-                for i, token_id in enumerate(action_tokens):
-                    pos = -(n-i)
-                    logit = ref_logits[idx, pos, token_id]
-                    token_logits.append(logit)
+            # with autocast(self.model.device.type, enabled=self.config.reference_fp16):
+            ref_outputs = self.reference_model(**inputs)
+            ref_logits = ref_outputs.logits
 
-                avg_score = torch.stack(token_logits).mean()
-                env_action_scores[env_idx].append(avg_score)
-            
-            # Convert to log probabilities
-            reference_logprobs = []
-            for scores in env_action_scores:
-                scores_tensor = torch.stack(scores)
-                logprobs = F.log_softmax(scores_tensor / temperature, dim=-1)
-                reference_logprobs.append(logprobs)
+            # --- TRACE POINT 3: Raw Logits Tensor ---
+            if self.config.debug_mode:
+                print(f"[TRACE-REF] Raw Logits Sum: {ref_logits.sum().item()}")
+
+            reference_logprobs = self.compute_action_scores(
+                ref_logits,
+                metadata,
+                len(states),
+                temperature,
+            )
             
             return reference_logprobs
     

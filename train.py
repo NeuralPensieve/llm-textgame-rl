@@ -24,12 +24,23 @@ def set_seed_and_determinism(seed=42):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed) # for multi-GPU
 
+    print(f"✅ Seeds set to {seed}")
+
+    # --- ADD THESE LINES ---
+    # This is the crucial setting that forces PyTorch to use deterministic algorithms.
+    # It covers more operations than the cudnn settings alone.
+    # torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # This environment variable is required for deterministic matmul operations.
+    # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    # ---------------------
+
     # Configure PyTorch for deterministic operations
     # This may impact performance, but is necessary for reproducibility
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    print(f"✅ Seeds set to {seed} and deterministic PyTorch operations enabled.")
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    
+    # print(f"✅ Seeds set to {seed} and deterministic PyTorch operations enabled.")
 
 def main():
     """Main training function"""
