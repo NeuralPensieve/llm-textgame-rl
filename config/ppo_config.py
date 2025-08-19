@@ -4,8 +4,8 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Model settings
-    model_name: str = "microsoft/DialoGPT-small"
-    # model_name: str = "openai-community/gpt2"
+    # model_name: str = "microsoft/DialoGPT-small"
+    model_name: str = "openai-community/gpt2"
     # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 1024  # Maximum sequence length
@@ -26,7 +26,7 @@ class PPOConfig:
     history_len: int = 3
 
     # PPO hyperparameters
-    batch_size: int = 2
+    batch_size: int = 4
     accumulation_steps: int = 16
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
@@ -57,7 +57,7 @@ class PPOConfig:
     epsilon: float = 0.0
     epsilon_decay: float = 0.95
     min_epsilon: float = 0.0
-    temperature: float = 1.0
+    temperature: float = 10.0
     min_temperature: float = 1.0
     temperature_decay: float = 0.9
 

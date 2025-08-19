@@ -163,15 +163,14 @@ class LLMPolicy(nn.Module):
 
         return padded
 
-    def compute_action_scores(
+    def _compute_raw_action_scores(
         self,
         logits: torch.Tensor,
         metadata: List[Tuple],
-        num_states: int,
-        temperature: float,
+        num_states: int
     ) -> List[torch.Tensor]:
-        """Compute action scores based on scoring method"""
-        env_action_logprobs = [[] for _ in range(num_states)]
+        """Computes the raw, unnormalized scores for actions based on the scoring method."""
+        env_action_scores = [[] for _ in range(num_states)]
 
         if self.prompt_manager.scoring_method == "action_token":
             for idx, (env_idx, action) in enumerate(metadata):
@@ -179,24 +178,34 @@ class LLMPolicy(nn.Module):
                     " " + action.strip(), add_special_tokens=False
                 )
                 n = len(action_tokens)
-
-                token_logits = []
-                for i, token_id in enumerate(action_tokens):
-                    pos = -(n - i)
-                    logit = logits[idx, pos, token_id]
-                    token_logits.append(logit)
-
+                token_logits = [logits[idx, -(n - i), token_id] for i, token_id in enumerate(action_tokens)]
                 avg_score = torch.stack(token_logits).mean()
-                env_action_logprobs[env_idx].append(avg_score)
+                env_action_scores[env_idx].append(avg_score)
+                
         elif self.prompt_manager.scoring_method == "helpful":
             helpful_token_id = self.target_tokens["helpful"]
-            for (env_idx, action), logit in zip(metadata, logits[:, -1, :]):
-                score = logit[helpful_token_id]
-                env_action_logprobs[env_idx].append(score)
+            scores = logits[:, -1, helpful_token_id]
+            for idx, (env_idx, _) in enumerate(metadata):
+                env_action_scores[env_idx].append(scores[idx])
+
         else:
             raise ValueError(f"Wrong scoring_method: {self.prompt_manager.scoring_method}")
+            
+        return env_action_scores
 
-        env_action_logprobs = [F.log_softmax(torch.stack(row) / temperature, dim=-1) for row in env_action_logprobs]
+    def compute_action_scores(
+        self,
+        logits: torch.Tensor,
+        metadata: List[Tuple],
+        num_states: int,
+        temperature: float,
+    ) -> List[torch.Tensor]:
+        """Compute action log-probabilities by normalizing raw scores."""
+        # Get raw scores from the new helper method
+        raw_scores = self._compute_raw_action_scores(logits, metadata, num_states)
+
+        # Apply log_softmax to the raw scores
+        env_action_logprobs = [F.log_softmax(torch.stack(row) / temperature, dim=-1) for row in raw_scores]
 
         return env_action_logprobs
 
@@ -208,8 +217,6 @@ class LLMPolicy(nn.Module):
         
         Returns a tuple of (action_logprobs, values, sequence_length).
         """
-        # self.model.train()   # This was the Heisenberg bug
-
         # Build action prompts
         action_prompts = []
         metadata = []
@@ -219,31 +226,15 @@ class LLMPolicy(nn.Module):
                 action_prompts.append(prompt)
                 metadata.append((i, action.strip()))
 
-        # --- TRACE POINT 1: Prompts ---
-        if self.config.debug_mode:
-            print(f"[TRACE-MAIN] Prompts Hash: {hash(tuple(action_prompts))}")
-
         # Get action scores
         action_inputs = self.tokenize_prompts(action_prompts)
         action_inputs = {k: v.to(self.model.device) for k, v in action_inputs.items()}
-
-        # --- TRACE POINT 2: Tokenized Input Tensor ---
-        if self.config.debug_mode:
-            print(f"[TRACE-MAIN] Input Tensor Sum: {action_inputs['input_ids'].sum().item()}")
 
         sequence_length = action_inputs['input_ids'].shape[1]
         
         with autocast(self.model.device.type):
             action_outputs = self.model(**action_inputs)
             action_logits = action_outputs.logits
-
-        # --- TRACE POINT 3: Raw Logits Tensor ---
-        if self.config.debug_mode:
-            print(f"[TRACE-MAIN] Raw Logits Sum: {action_logits.sum().item()}")
-
-        if self.config.debug_mode:
-            print(f"[evaluate_actions] Input shape: {action_inputs['input_ids'].shape}")
-            print(f"[evaluate_actions] First prompt tokens (last 10): {action_inputs['input_ids'][0, -10:].tolist()}")
 
         env_action_logprobs = self.compute_action_scores(
             action_logits,
@@ -267,44 +258,26 @@ class LLMPolicy(nn.Module):
         Evaluate actions without gradients, ensuring the model's training
         state is preserved.
         """
-        # 1. Save the model's original training mode
         was_training = self.training
-        
         try:
-            # 2. Set the model to evaluation mode for this operation
             self.eval()
+            
+            action_prompts = []
+            metadata = []
+            for i, (state, actions) in enumerate(zip(states, action_lists)):
+                for action in actions:
+                    prompt = self.prompt_manager.get_action_prompt(state, actions, action)
+                    action_prompts.append(prompt)
+                    metadata.append((i, action.strip()))
+            
+            inputs = self.tokenize_prompts(action_prompts)
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
-            # The rest of the function's logic remains the same
-            env_action_scores = []
-
-            for state, actions in zip(states, action_lists):
-                action_prompts = [
-                    self.prompt_manager.get_action_prompt(state, actions, action)
-                    for action in actions
-                ]
+            with torch.no_grad(), autocast(self.model.device.type):
+                logits, _ = self.forward(**inputs)
                 
-                inputs = self.tokenize_prompts(action_prompts)
-                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-                with torch.no_grad(), autocast(self.model.device.type):
-                    logits, _ = self.forward(**inputs)
-                    # This part is unchanged
-                    if self.prompt_manager.scoring_method == "action_token":
-                        action_scores = []
-                        actions_tokens = [self.tokenizer.encode(f" {a}", add_special_tokens=False) for a in actions]
-                        input_ids = inputs["input_ids"]
-                        for i, tokens in enumerate(actions_tokens):
-                            n = len(tokens)
-                            logits_i = logits[i, -n:]
-                            actions_tensor = torch.tensor(tokens, device=logits.device)
-                            selected = logits_i.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-                            action_scores.append(selected.mean())
-                    elif self.prompt_manager.scoring_method == "helpful":
-                        helpful_token_id = self.target_tokens["helpful"]
-                        action_scores = [logit[helpful_token_id] for logit in logits[:, -1, :]]
-                    
-                    action_scores_tensor = torch.stack(action_scores)
-                    env_action_scores.append(action_scores_tensor.cpu().tolist())
+                raw_scores = self._compute_raw_action_scores(logits, metadata, len(states))
+                env_action_scores = [torch.stack(row).cpu().tolist() for row in raw_scores]
 
             state_inputs = self.tokenize_prompts(states)
             state_inputs = {k: v.to(self.model.device) for k, v in state_inputs.items()}
@@ -316,7 +289,6 @@ class LLMPolicy(nn.Module):
             return env_action_scores, values_list
 
         finally:
-            # 3. CRITICAL: Restore the original mode, no matter what happens
             if was_training:
                 self.train()
 
