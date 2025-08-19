@@ -1,136 +1,49 @@
-import torch
 import numpy as np
-import random
-from typing import List, Dict, Tuple
-from tqdm import tqdm
-from torch.amp import autocast
+from typing import List, Tuple
 
+from .experience_roller import ExperienceRoller
 
 class RolloutCollector:
-    """Handles experience collection from environments"""
-
-    def __init__(self, policy, envs, config, device, logger):
-        self.policy = policy
-        self.envs = envs
+    """
+    Handles experience collection by running full episodes.
+    This is a wrapper around the unified ExperienceRoller.
+    """
+    def __init__(self, policy, config, device, logger):
         self.config = config
-        self.device = device
         self.logger = logger
+        self.roller = ExperienceRoller(policy, config, device)
+        self.num_envs = config.num_envs # Number of parallel envs for training
 
-    def collect_rollouts(self, temperature: float, epsilon: float) -> Tuple[List[Dict], List[int], List[float]]:
-        """Collect experience from environments"""        
-        rollout_buffer = []
-        
-        # Initialize states
-        states = [env.reset() for env in self.envs]
-
-        episode_rewards = [0.0] * len(self.envs)
-        episode_lengths = [0] * len(self.envs)
-        all_episode_rewards = []
-        all_episode_lengths = []
-
-        self.logger.info(f"Collecting rollouts for {self.config.num_steps} steps...")
-        
-        for step in tqdm(range(self.config.num_steps), desc="Collecting Rollouts"):
-            # Get valid actions for all environments
-            batch_states = []
-            batch_actions = []
-
-            for env, state in zip(self.envs, states):
-                actions = env.get_valid_actions()
-                batch_states.append(state)
-                batch_actions.append(actions)
-
-            with torch.no_grad(), autocast(self.device.type):
-                action_scores, values = self.policy.evaluate_for_rollout(batch_states, batch_actions)
-
-            new_states = [None] * len(self.envs)
-            
-            for i, env in enumerate(self.envs):
-                actions = batch_actions[i]
-                
-                # Use the provided temperature sampling method
-                action_idx, old_logprob_indexed = self.temperature_sampling(action_scores[i], temperature)
-                chosen_action = actions[action_idx] if actions else "wait"
-                
-                next_state, reward, done, info = env.step(chosen_action)
-
-                episode_rewards[i] += reward
-                episode_lengths[i] += 1
-
-                rollout_buffer.append({
-                    "env_idx": i,
-                    "state": states[i],
-                    "action": chosen_action,
-                    "action_idx": action_idx,
-                    "available_actions": actions,
-                    "old_logprob": old_logprob_indexed,
-                    "value": values[i],
-                    "reward": reward,
-                    "done": done,
-                })
-
-                # --- CORRECTED RESET AND STATE UPDATE LOGIC ---
-                if done:
-                    all_episode_rewards.append(episode_rewards[i])
-                    all_episode_lengths.append(episode_lengths[i])
-                    
-                    # Reset the environment and use the new state for the next step
-                    new_states[i] = env.reset()
-                    
-                    # Reset trackers for the new episode
-                    episode_rewards[i] = 0.0
-                    episode_lengths[i] = 0
-                else:
-                    # Continue the current episode
-                    new_states[i] = next_state
-            
-            states = new_states
-
-        # IMPORTANT FIX: Add any remaining incomplete episodes to the statistics
-        # This ensures consistency with the evaluator which counts all episodes
-        for i in range(len(self.envs)):
-            if episode_lengths[i] > 0:  # This environment has an incomplete episode
-                all_episode_rewards.append(episode_rewards[i])
-                all_episode_lengths.append(episode_lengths[i])
-    
-        return rollout_buffer, all_episode_lengths, all_episode_rewards
-    
-    def temperature_sampling(self, raw_scores, temperature: float) -> Tuple[int, float]:
+    def collect_rollouts(self, temperature: float) -> Tuple[List[dict], List[int], List[float]]:
         """
-        Apply temperature sampling to raw action scores with numerical stability.
+        Collect experience from environments by running a batch of episodes to completion.
         
         Args:
-            raw_scores: Raw action scores (logits) from the policy.
-            temperature: Temperature parameter for sampling.
-        
+            temperature (float): The temperature for sampling actions.
+
         Returns:
-            action_idx: The selected action index.
-            old_logprob: The log probability of the selected action from the original policy.
+            A tuple containing the rollout buffer, a list of all episode lengths, 
+            and a list of all episode rewards.
         """
-        scores = np.array(raw_scores)
+        self.logger.info(f"Collecting rollouts from {self.num_envs} parallel environments (episode-centric)...")
 
-        # Prevent errors on empty scores list
-        if not scores.any():
-            return 0, -np.inf
-        
-        # Apply temperature for sampling distribution
-        scaled_scores = scores / temperature
-        
-        # Create sampling probabilities with numerical stability
-        # Subtracting the max score prevents overflow when exponentiating
-        scaled_scores_stable = scaled_scores - np.max(scaled_scores)
-        sampling_probs = np.exp(scaled_scores_stable) / np.sum(np.exp(scaled_scores_stable))
+        # Use the unified roller in "training" mode
+        rollout_buffer, finished_episodes = self.roller.run(
+            num_episodes=self.num_envs,
+            temperature=temperature,
+            is_eval_mode=False
+        )
 
-        # Sample an action from the modified distribution
-        action_idx = np.random.choice(len(sampling_probs), p=sampling_probs)
+        # Extract stats from the results
+        all_episode_lengths = [ep.length for ep in finished_episodes]
+        all_episode_rewards = [ep.reward for ep in finished_episodes]
         
-        # Now, calculate the log probability from the ORIGINAL, non-scaled scores
-        # This is the log-softmax function, also with a stability trick
-        original_scores_stable = scores - np.max(scores)
-        exp_scores = np.exp(original_scores_stable)
-        log_sum_exp = np.log(np.sum(exp_scores))
-        original_logprobs = original_scores_stable - log_sum_exp
-        
-        old_logprob = original_logprobs[action_idx]
-        
-        return action_idx, old_logprob
+        total_steps = len(rollout_buffer)
+        avg_len = np.mean(all_episode_lengths) if all_episode_lengths else 0
+        avg_rew = np.mean(all_episode_rewards) if all_episode_rewards else 0
+
+        self.logger.info(f"Collection complete. Total steps: {total_steps}. "
+                         f"Completed episodes: {len(finished_episodes)}. "
+                         f"Avg Length: {avg_len:.2f}, Avg Reward: {avg_rew:.4f}")
+
+        return rollout_buffer, all_episode_lengths, all_episode_rewards

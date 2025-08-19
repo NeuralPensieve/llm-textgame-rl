@@ -16,7 +16,7 @@ class PPOConfig:
 
     # Environment
     num_envs: int = 16
-    num_evals: int = 20
+    num_evals: int = 16
     reuse_seed: bool = False
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
@@ -24,6 +24,7 @@ class PPOConfig:
     repeatable: bool = False
     step_penalty: float = 0.1
     history_len: int = 3
+    micro_batch_size: int = 8
 
     # PPO hyperparameters
     batch_size: int = 4

@@ -26,58 +26,46 @@ class PPOUpdater:
 
     def compute_advantages(self, rollout_buffer: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute GAE advantages and returns, correctly handling episode boundaries
-        within the rollout buffer.
+        Compute GAE advantages and returns. This version is simplified for episode-centric
+        rollouts, where each environment's data is a single, complete episode.
         """
-        # Group experiences by environment index only.
+        # Group experiences by environment index, which now corresponds to a single episode.
         experiences_by_env = defaultdict(list)
         for exp in rollout_buffer:
             experiences_by_env[exp["env_idx"]].append(exp)
 
-        all_advantages = []
-        all_returns = []
+        # Buffers to hold the flat list of advantages and returns for the entire batch.
+        advantages_flat = [0] * len(rollout_buffer)
+        returns_flat = [0] * len(rollout_buffer)
 
-        # Process each environment's trajectory independently.
+        # Process each episode's trajectory independently.
         for env_idx in sorted(experiences_by_env.keys()):
             experiences = experiences_by_env[env_idx]
-            if not experiences:
-                continue
-
-            advantages_ep = np.zeros(len(experiences), dtype=np.float32)
-            returns_ep = np.zeros(len(experiences), dtype=np.float32)
             
-            # Bootstrap value from the last state if the episode was truncated by the rollout limit.
-            last_exp = experiences[-1]
-            if not last_exp["done"]:
-                next_value = last_exp["value"]
-            else:
-                next_value = 0.0
-            
+            # Since we collect full episodes, the value after the last state is always 0.
+            # There is no need to bootstrap from the value function for truncated rollouts.
+            next_value = 0.0
             last_advantage = 0.0
             
-            # Loop backwards through the experiences for this environment.
+            # Loop backwards through the episode's experiences.
             for i, exp in reversed(list(enumerate(experiences))):
                 delta = exp["reward"] + self.config.gamma * next_value - exp["value"]
                 advantage = delta + self.config.gamma * self.config.gae_lambda * last_advantage
                 
-                returns_ep[i] = advantage + exp["value"]
-                advantages_ep[i] = advantage
+                # We need the original index from the flat rollout_buffer to place the results.
+                # This is a bit tricky, so we'll just re-calculate the buffer later.
+                # For now, let's build per-episode lists.
+                
+                # Store the computed advantage and return for this step.
+                returns_flat[rollout_buffer.index(exp)] = advantage + exp["value"]
+                advantages_flat[rollout_buffer.index(exp)] = advantage
 
-                if exp["done"]:
-                    last_advantage = 0.0
-                    next_value = 0.0
-                else:
-                    last_advantage = advantage
-                    next_value = exp["value"]
+                # The next_value for the previous step is the value of the current state.
+                next_value = exp["value"]
+                last_advantage = advantage
 
-            all_advantages.append(advantages_ep)
-            all_returns.append(returns_ep)
-
-        advantages_by_env_step = list(zip(*[adv for adv in all_advantages]))
-        returns_by_env_step = list(zip(*[ret for ret in all_returns]))
-        
-        advantages = np.array([item for sublist in advantages_by_env_step for item in sublist])
-        returns = np.array([item for sublist in returns_by_env_step for item in sublist])
+        advantages = np.array(advantages_flat, dtype=np.float32)
+        returns = np.array(returns_flat, dtype=np.float32)
 
         if self.config.normalize_advantage:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -95,10 +83,7 @@ class PPOUpdater:
                 self.logger.info(f"DYNAMIC CONFIG UPDATED at iteration {iteration}")
                 
                 for param, (old_val, new_val) in changes.items():
-                    # Log to terminal for ALL parameters
                     self.logger.info(f"  {param}: {old_val} → {new_val}")
-
-                    # Special handling for learning rate changes
                     if param == 'learning_rate':
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = new_val

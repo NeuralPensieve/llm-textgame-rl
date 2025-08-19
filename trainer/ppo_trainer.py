@@ -5,7 +5,6 @@ import os
 import wandb
 from torch.amp import GradScaler
 
-from env import TextWorldEnvironment
 from config import PPOConfig
 from models import LLMPolicy
 from trainer import BaseTrainer, RolloutCollector, Evaluator, PPOUpdater
@@ -16,17 +15,8 @@ class PPOTextWorldTrainer(BaseTrainer):
 
     def __init__(self, config: PPOConfig):
         super().__init__(config)
-        
-        # Clear games folder
-        if not os.path.exists("./games"):
-            os.makedirs("./games")
-        else:
-            if not self.config.reuse_seed:
-                for f in os.listdir("./games"):
-                    os.remove(os.path.join("./games", f))
 
         # Create environments and policy
-        self.envs = [TextWorldEnvironment(config=config) for _ in range(config.num_envs)]
         self.policy = LLMPolicy(config).to(self.device)
 
         # Disable cache for transformer models during training
@@ -52,14 +42,8 @@ class PPOTextWorldTrainer(BaseTrainer):
         os.makedirs("checkpoints", exist_ok=True)
 
         # Initialize components
-        self.rollout_collector = RolloutCollector(
-            self.policy, self.envs, config, self.device, self.logger
-        )
-        # torch.cuda.empty_cache()
-
+        self.rollout_collector = RolloutCollector(self.policy, config, self.device, self.logger)
         self.evaluator = Evaluator(self.policy, config, self.device, self.logger)
-        # torch.cuda.empty_cache()
-
         self.ppo_updater = PPOUpdater(
             config,
             self.policy,
@@ -69,7 +53,6 @@ class PPOTextWorldTrainer(BaseTrainer):
             self.device,
             self.logger,
         )
-        # torch.cuda.empty_cache()
 
 
     def train(self):
@@ -95,29 +78,22 @@ class PPOTextWorldTrainer(BaseTrainer):
 
             # Collect rollouts
             rollout_buffer, episode_lengths, episode_rewards = (
-                self.rollout_collector.collect_rollouts(temperature=self.temperature, epsilon=self.epsilon)
+                self.rollout_collector.collect_rollouts(temperature=self.temperature)
             )
 
-            # Calculate metrics
-            rewards = [exp["reward"] for exp in rollout_buffer]
-            avg_reward = np.mean(rewards)
-            avg_episode_length = np.mean(episode_lengths)
-            avg_episode_reward = np.mean(episode_rewards)
-            total_episode_reward = np.sum(episode_rewards)
+            # Calculate and log metrics
+            if rollout_buffer:
+                avg_episode_length = np.mean(episode_lengths) if episode_lengths else 0
+                avg_episode_reward = np.mean(episode_rewards) if episode_rewards else 0
 
-            # Log iteration metrics
-            wandb.log(
-                {
+                wandb.log({
                     "iteration": iteration,
-                    "avg_reward": avg_reward,
                     "avg_episode_length": avg_episode_length,
                     "avg_episode_reward": avg_episode_reward,
-                    "total_episode_reward": total_episode_reward,
-                    "total_experiences": len(rollout_buffer),
-                    "epsilon": self.epsilon,
-                    "temperature": self.temperature,
-                }
-            )
+                    "total_experiences_collected": len(rollout_buffer),
+                    "epsilon (decaying)": self.epsilon, # Epsilon can still be logged if used elsewhere
+                    "temperature (decaying)": self.temperature,
+                })
 
             # Update policy
             self.ppo_updater.ppo_update(rollout_buffer, iteration, self.temperature)
@@ -134,12 +110,8 @@ class PPOTextWorldTrainer(BaseTrainer):
 
             # Calculate iteration duration and normalize by rollout size
             end_time = datetime.datetime.now()
-            iteration_duration = (
-                end_time - start_time
-            ).total_seconds()  # Duration in seconds
-            rollout_size = (
-                len(rollout_buffer) if rollout_buffer else 1
-            )  # Avoid division by zero
+            iteration_duration = (end_time - start_time).total_seconds()
+            rollout_size = len(rollout_buffer) if rollout_buffer else 1
             normalized_duration = iteration_duration / rollout_size
 
             # Log iteration metrics
@@ -168,6 +140,7 @@ class PPOTextWorldTrainer(BaseTrainer):
             "scaler_state_dict": self.scaler.state_dict(),
             "config": self.config,
             "epsilon": self.epsilon,
+            "temperature": self.temperature,
         }
 
         run_name = datetime.datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
@@ -193,9 +166,9 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         self.iteration = checkpoint["iteration"]
         self.epsilon = checkpoint["epsilon"]
+        self.temperature = checkpoint.get("temperature", self.config.temperature) # Load temperature
 
-        # Update components with loaded state
-        self.rollout_collector.update_epsilon(self.epsilon)
-        self.rollout_collector.update_temperature(self.temperature)
-
-        self.logger.info(f"Checkpoint loaded: {checkpoint_path}")
+        # --- CHANGE: Removed obsolete update calls. ---
+        # The temperature is now passed directly to collect_rollouts in the train loop.
+        
+        self.logger.info(f"Checkpoint loaded from {checkpoint_path} at iteration {self.iteration}")
