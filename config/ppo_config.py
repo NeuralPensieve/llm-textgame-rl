@@ -4,8 +4,8 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Model settings
-    # model_name: str = "microsoft/DialoGPT-small"
-    model_name: str = "openai-community/gpt2"
+    model_name: str = "microsoft/DialoGPT-small"
+    # model_name: str = "openai-community/gpt2"
     # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 1024  # Maximum sequence length

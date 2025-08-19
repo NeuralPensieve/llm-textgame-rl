@@ -93,7 +93,6 @@ class ExperienceRoller:
                 batch_states = [states[i] for i in active_indices]
                 batch_actions = [envs[i].get_valid_actions() for i in active_indices]
 
-                # --- CHANGE: Process the batch using the micro-batching helper ---
                 action_scores, values = self._process_micro_batches(batch_states, batch_actions)
 
                 # The rest of the loop remains the same, as it processes the aggregated results.

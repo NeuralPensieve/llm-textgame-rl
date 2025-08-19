@@ -72,7 +72,8 @@ class LLMPolicy(nn.Module):
             if hasattr(self.reference_model, 'gradient_checkpointing_disable'):
                 self.reference_model.gradient_checkpointing_disable()
         
-        self._cache_target_tokens()
+        if self.prompt_manager.scoring_method == "helpful":
+            self._cache_target_tokens()
 
     def _cache_target_tokens(self):
         """Cache target token IDs for 'helpful' scoring"""
@@ -84,8 +85,6 @@ class LLMPolicy(nn.Module):
             self.target_tokens["helpful"] = helpful_token_id[-1]
         else:
             raise ValueError("Could not tokenize 'helpful'")
-
-        self.logger.info(f"Cached target tokens: {self.target_tokens}")
 
     def forward(self, input_ids, attention_mask=None):
         """Forward pass through model with FP16"""
