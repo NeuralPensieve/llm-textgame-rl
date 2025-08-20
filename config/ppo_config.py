@@ -4,8 +4,8 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Model settings
-    model_name: str = "microsoft/DialoGPT-small"
-    # model_name: str = "openai-community/gpt2"
+    # model_name: str = "microsoft/DialoGPT-small"
+    model_name: str = "openai-community/gpt2"
     # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 1024  # Maximum sequence length
@@ -20,7 +20,7 @@ class PPOConfig:
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
     num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = False
+    repeatable: bool = True
     step_penalty: float = 0.1
     history_len: int = 3
     micro_batch_size: int = 8
@@ -32,7 +32,7 @@ class PPOConfig:
     learning_rate_value_head: float = 1e-4
     epsilon_clip: float = 0.2
     ppo_epochs: int = 4
-    gamma: float = 0.9
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     max_grad_norm: float = 0.5
     normalize_advantage: bool = True
@@ -57,9 +57,9 @@ class PPOConfig:
     epsilon: float = 0.0
     epsilon_decay: float = 0.95
     min_epsilon: float = 0.0
-    temperature: float = 10.0
-    min_temperature: float = 1.0
-    temperature_decay: float = 0.9
+    temperature: float = 2.5
+    min_temperature: float = 0.5
+    temperature_decay: float = 0.995
 
 
     # Evaluation

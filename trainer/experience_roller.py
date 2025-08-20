@@ -17,6 +17,7 @@ class EpisodeStats(NamedTuple):
     reward: float
     completed: bool
     game_log: str
+    action_log_probs: List[float]
 
 
 class ExperienceRoller:
@@ -52,6 +53,8 @@ class ExperienceRoller:
         # Manages which environments (episodes) are completely done.
         active_envs_mask = [True] * num_episodes
         current_lengths = np.zeros(num_episodes, dtype=int)
+        current_rewards = np.zeros(num_episodes, dtype=float)
+        episode_action_log_probs = [[] for _ in range(num_episodes)]
         num_sample_games = min(num_episodes, 5) if is_eval_mode else 0
         game_logs = [[] for _ in range(num_sample_games)]
         if is_eval_mode:
@@ -79,6 +82,10 @@ class ExperienceRoller:
                 
                 # Manages which environments have completed the CURRENT turn's action.
                 turn_complete_mask = [False] * len(active_indices)
+
+                # Accumulator for the action's total log probability
+                turn_log_probs = np.zeros(len(active_indices), dtype=float)
+
                 # Stores the buffer indices for the current turn to update the final reward later.
                 turn_buffer_indices = [[] for _ in range(len(active_indices))]
                 partial_commands_str = [""] * len(active_indices)
@@ -120,6 +127,9 @@ class ExperienceRoller:
 
                     for i, (token_id, logprob) in enumerate(zip(next_token_ids, chosen_log_probs)):
                         original_turn_idx = active_turn_indices[i]
+
+                        # Add the logprob of the SAMPLED token to the accumulator
+                        turn_log_probs[original_turn_idx] += logprob
                         
                         path = tries[original_turn_idx].update_head(token_id)
 
@@ -164,6 +174,8 @@ class ExperienceRoller:
                     next_obs, reward, done, info = envs[original_env_idx].step(action_text)
 
                     current_lengths[original_env_idx] += 1
+                    current_rewards[original_env_idx] += reward
+                    episode_action_log_probs[original_env_idx].append(turn_log_probs[i])
 
                     # Create the new, simplified log entry
                     if original_env_idx < num_sample_games:
@@ -171,7 +183,7 @@ class ExperienceRoller:
                         log_entry = [
                             f"--- Step {step_number} ---",
                             f"STATE:\n{current_obs_for_log}",
-                            f"CHOSEN ACTION: {action_text}",
+                            f"CHOSEN ACTION: {action_text} (Prob: {np.exp(turn_log_probs[i]):.8f})",
                             f"REWARD: {reward}\n",
                         ]
                         game_logs[original_env_idx].extend(log_entry)
@@ -195,13 +207,14 @@ class ExperienceRoller:
 
                         # The length for stats is the number of turns taken
                         episode_turn_length = current_lengths[original_env_idx]
-                        total_reward = sum(exp['reward'] for exp in rollout_buffer if exp['env_idx'] == original_env_idx)
+                        total_reward = current_rewards[original_env_idx]
 
                         finished_episodes.append(EpisodeStats(
                             length=episode_turn_length,
                             reward=total_reward,
                             completed=game_won,
-                            game_log=game_log_str
+                            game_log=game_log_str,
+                            action_log_probs=episode_action_log_probs[original_env_idx]
                         ))
                         pbar.update(1)
         

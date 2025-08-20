@@ -24,14 +24,6 @@ class RolloutCollector:
     def collect_rollouts(self, temperature: float, is_eval_mode: bool = False) -> Tuple[List[Dict], List[EpisodeStats]]:
         """
         Collects experience by running a batch of episodes to completion.
-        
-        Args:
-            temperature (float): The temperature for sampling actions.
-            is_eval_mode (bool): Flag to determine if this is for evaluation.
-
-        Returns:
-            A tuple containing the token-level rollout buffer (empty if eval)
-            and a list of EpisodeStats for each completed episode.
         """
         mode = "Evaluation" if is_eval_mode else "Training Rollout"
         num_episodes = self.config.num_eval_episodes if is_eval_mode else self.num_envs
@@ -42,12 +34,6 @@ class RolloutCollector:
             temperature=temperature,
             is_eval_mode=is_eval_mode
         )
-
-        # Log the game logs if in evaluation mode
-        # if is_eval_mode:
-        #     for episode_stat in finished_episodes:
-        #         if episode_stat.game_log:
-        #             self.logger.info(episode_stat.game_log)
 
         # Post-process to get final stats for logging
         if not finished_episodes:

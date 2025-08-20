@@ -182,6 +182,8 @@ class PPOUpdater:
             )
         self.logger.info("--- PPO Update Finished ---")
 
+        torch.cuda.empty_cache()
+
     def _kl_sanity_check(self, states, tokens):
         """
         On the first batch, verifies that the KL divergence between the policy

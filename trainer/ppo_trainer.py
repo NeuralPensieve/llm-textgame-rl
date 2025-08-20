@@ -96,11 +96,17 @@ class PPOTextWorldTrainer(BaseTrainer):
             if finished_episodes:
                 episode_lengths = [ep.length for ep in finished_episodes]
                 episode_rewards = [ep.reward for ep in finished_episodes]
+
+                all_action_log_probs = [
+                    prob for ep in finished_episodes for prob in ep.action_log_probs
+                ]
+                avg_action_log_prob = np.mean(all_action_log_probs) if all_action_log_probs else 0.0
                 
                 wandb.log({
                     "iteration": iteration,
                     "avg_episode_length": np.mean(episode_lengths),
                     "avg_episode_reward": np.mean(episode_rewards),
+                    "avg_action_log_prob": avg_action_log_prob,
                     "total_experiences_collected": len(rollout_buffer),
                     "temperature (decaying)": self.temperature,
                 })
