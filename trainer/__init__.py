@@ -11,7 +11,6 @@ This package contains modular components for PPO training:
 
 from .base_trainer import BaseTrainer
 from .rollout_collector import RolloutCollector
-from .evaluator import Evaluator
 from .experience_roller import ExperienceRoller
 from .ppo_updater import PPOUpdater
 from .ppo_trainer import PPOTextWorldTrainer
@@ -19,7 +18,6 @@ from .ppo_trainer import PPOTextWorldTrainer
 __all__ = [
     "BaseTrainer",
     "RolloutCollector",
-    "Evaluator",
     "PPOUpdater",
     "PPOTextWorldTrainer",
     "ExperienceRoller",

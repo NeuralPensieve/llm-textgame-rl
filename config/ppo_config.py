@@ -15,8 +15,7 @@ class PPOConfig:
     
 
     # Environment
-    num_envs: int = 16
-    num_evals: int = 16
+    num_envs: int = 32
     reuse_seed: bool = False
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
@@ -27,7 +26,7 @@ class PPOConfig:
     micro_batch_size: int = 8
 
     # PPO hyperparameters
-    batch_size: int = 4
+    batch_size: int = 16
     accumulation_steps: int = 16
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
