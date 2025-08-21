@@ -82,15 +82,8 @@ class PPOUpdater:
         
         advantages, returns = self.compute_advantages(rollout_buffer)
 
-        # # =================== ADD THIS BLOCK ===================
-        # # Normalize the returns to make the value function's target more stable
-        # returns_mean = returns.mean()
-        # returns_std = returns.std() + 1e-8 # Add epsilon for numerical stability
-        # returns = (returns - returns_mean) / returns_std
-        # # ======================================================
-
         # ===== VALUE FUNCTION DIAGNOSTICS =====
-        if iteration % 5 == 0:  # Every 5 iterations
+        if iteration % 1 == 0:
             with torch.no_grad():
                 self.value_diagnostics(rollout_buffer, advantages, returns, iteration)
 

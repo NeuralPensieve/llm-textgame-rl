@@ -36,11 +36,11 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # Training settings
-    num_iterations: int = 200
+    num_iterations: int = 500
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
-    disable_value_function: bool = True  # Disable value function training
+    disable_value_function: bool = False  # Disable value function training
 
     # Loss settings
     value_loss_coef: float = 0.05
