@@ -51,6 +51,7 @@ class LLMPolicy(nn.Module):
             self.reference_model.eval()
             if hasattr(self.reference_model, 'gradient_checkpointing_disable'):
                 self.reference_model.gradient_checkpointing_disable()
+            self.logger.info("Reference model created successfully.")
 
     def forward(self, input_ids, attention_mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """

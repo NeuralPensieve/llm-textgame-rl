@@ -86,7 +86,7 @@ def tokenize_actions_for_trie(action_list: List[str], tokenizer: AutoTokenizer) 
     tokenized_actions = []
     for action_str in action_list:
         # Tokenize the action, appending a space before the action string
-        token_ids = tokenizer.encode(f" {action_str}", add_special_tokens=False)
+        token_ids = tokenizer.encode(action_str, add_special_tokens=False)
         # Manually append the EOS token ID
         token_ids.append(tokenizer.eos_token_id)
         tokenized_actions.append(token_ids)

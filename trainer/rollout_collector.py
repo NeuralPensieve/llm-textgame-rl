@@ -30,6 +30,7 @@ class RolloutCollector:
         self.logger.info(f"Starting {mode} with {num_episodes} parallel environments...")
 
         rollout_buffer, finished_episodes = self.roller.run(
+            envs=self.roller.eval_envs if is_eval_mode else self.roller.train_envs,
             num_episodes=num_episodes,
             temperature=temperature,
             is_eval_mode=is_eval_mode

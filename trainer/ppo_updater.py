@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import wandb
+import gc
 from typing import List, Dict, Tuple
 from collections import defaultdict
 from torch.amp import autocast
@@ -44,11 +45,10 @@ class PPOUpdater:
             
             # The value after the last state is 0 if the episode is done.
             next_value = 0.0
-            if not experiences[-1]["done"]:
-                # Bootstrap from the value of the last state if the episode was truncated
-                # This requires a forward pass on the final state, which we omit for simplicity.
-                # A common approximation is to set it to 0.
-                next_value = 0.0
+
+            # Bootstrap if the episode was truncated AND it did not simultaneously finish.
+            if experiences[-1]["truncated"] and not experiences[-1]["finished"]:
+                next_value = experiences[-1]["value"]
 
             last_advantage = 0.0
 
@@ -110,10 +110,13 @@ class PPOUpdater:
                 batch_composite_states = [exp["state"] for exp in batch_experiences]
                 batch_chosen_tokens = [exp["action"] for exp in batch_experiences]
 
+                # Only the get the first sampled token, not the following deterministic tokens
+                batch_first_tokens = [tokens[0] for tokens in batch_chosen_tokens]
+
                 # Forward pass with the new method
                 with autocast(self.device.type):
                     current_logprobs, current_values = self.policy.evaluate_tokens(
-                        batch_composite_states, batch_chosen_tokens
+                        batch_composite_states, batch_first_tokens
                     )
 
                     # --- KL Divergence Calculation ---
@@ -121,11 +124,11 @@ class PPOUpdater:
                     if self.config.use_kl_penalty:
                         # Sanity check on the first batch of the first iteration
                         if iteration == 0 and epoch == 0 and start == 0:
-                            self._kl_sanity_check(batch_composite_states, batch_chosen_tokens)
+                            self._kl_sanity_check(batch_composite_states, batch_first_tokens)
 
                         # Get logprobs from the reference model
                         reference_logprobs = self.policy.get_reference_token_logprobs(
-                            batch_composite_states, batch_chosen_tokens
+                            batch_composite_states, batch_first_tokens
                         )
                         kl_div = self.policy.compute_kl_divergence(current_logprobs, reference_logprobs)
                         epoch_kl_values.append(kl_div.item())
@@ -182,6 +185,12 @@ class PPOUpdater:
             )
         self.logger.info("--- PPO Update Finished ---")
 
+        del advantages
+        del returns
+        del old_logprobs
+    
+        # Run garbage collection and clear cache
+        gc.collect()
         torch.cuda.empty_cache()
 
     def _kl_sanity_check(self, states, tokens):

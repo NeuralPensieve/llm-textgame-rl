@@ -8,7 +8,7 @@ class PPOConfig:
     model_name: str = "openai-community/gpt2"
     # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    max_length: int = 1024  # Maximum sequence length
+    max_length: int = 1000  # Maximum sequence length, leaving 24 for generated actions
     scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     dynamic_config: bool = False
     debug_mode: bool = False
@@ -57,7 +57,7 @@ class PPOConfig:
     epsilon: float = 0.0
     epsilon_decay: float = 0.95
     min_epsilon: float = 0.0
-    temperature: float = 2.5
+    temperature: float = 1.0
     min_temperature: float = 0.5
     temperature_decay: float = 0.995
 
@@ -67,5 +67,5 @@ class PPOConfig:
     num_sample_games: int = 5
 
     # KL Penalty settings
-    use_kl_penalty: bool = True  # ONLY works with action_token
+    use_kl_penalty: bool = False  # ONLY works with action_token
     reference_fp16: bool = False  # Use FP16 for reference model to save memory

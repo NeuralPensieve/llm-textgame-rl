@@ -30,8 +30,19 @@ class ExperienceRoller:
         self.config = config
         self.device = device
         self.tokenizer_helper = tokenizer_helper
+        self.eos_token_id = self.tokenizer_helper.tokenizer.eos_token_id
 
-    def run(self, num_episodes: int, temperature: float, is_eval_mode: bool) -> Tuple[List[Dict], List[EpisodeStats]]:
+        self.train_envs = [
+            TextWorldEnvironment(config=self.config, is_eval_env=False, game_id=i) 
+            for i in range(self.config.num_envs)
+        ]
+        
+        self.eval_envs = [
+            TextWorldEnvironment(config=self.config, is_eval_env=True, game_id=i) 
+            for i in range(self.config.num_eval_episodes)
+        ]
+
+    def run(self, envs: List[TextWorldEnvironment], num_episodes: int, temperature: float, is_eval_mode: bool) -> Tuple[List[Dict], List[EpisodeStats]]:
         """
         Runs N parallel rollouts until each episode is complete.
         Args:
@@ -44,7 +55,6 @@ class ExperienceRoller:
                 - List of EpisodeStats for each completed episode.
         """
         # --- OUTER LOOP SETUP ---
-        envs = [TextWorldEnvironment(config=self.config, is_eval_env=is_eval_mode) for _ in range(num_episodes)]
         game_observations = [env.reset() for env in envs]
         
         rollout_buffer = []
@@ -71,6 +81,19 @@ class ExperienceRoller:
                 # Get actions and create a Trie for each active environment.
                 available_actions = [envs[i].get_valid_actions() for i in active_indices]
                 tokenized_for_tries = [tokenize_actions_for_trie(act, self.tokenizer_helper.tokenizer) for act in available_actions]
+
+                # ADD THIS ADVANCED DEBUG CODE
+                eos_id = self.eos_token_id
+                for i, tokenized_actions in enumerate(tokenized_for_tries):
+                    for j, token_list in enumerate(tokenized_actions):
+                        # Check if an action tokenizes to just the EOS token
+                        if token_list == [eos_id]:
+                            original_env_idx = active_indices[i]
+                            problematic_action = available_actions[i][j]
+                            print(f"DEBUG: Problematic action found in env_idx {original_env_idx}!")
+                            print(f'DEBUG: Action "{problematic_action}" (length {len(problematic_action)}) tokenized to just [EOS_token].')
+                # END OF DEBUG CODE
+
                 start_token_id = self.tokenizer_helper.tokenizer.encode(">", add_special_tokens=False)[0]
 
                 tries = []
@@ -111,7 +134,7 @@ class ExperienceRoller:
                     
                     # --- 3. GET POLICY OUTPUT ---
                     batch_tries = [tries[i] for i in active_turn_indices]
-                    token_mask = generate_mask(batch_tries, self.tokenizer_helper.tokenizer.vocab_size).to(self.policy.device)
+                    token_mask = generate_mask(batch_tries, self.policy.model.config.vocab_size).to(self.policy.device)
 
                     batch_input_ids = batch_input_ids.to(self.policy.device)
                     batch_attention_mask = batch_attention_mask.to(self.policy.device)
@@ -133,30 +156,27 @@ class ExperienceRoller:
                         
                         path = tries[original_turn_idx].update_head(token_id)
 
-                        # --- Only store experiences in the buffer during training ---
                         if not is_eval_mode:
                             state_for_log = (game_observations[active_indices[original_turn_idx]], partial_commands_str[original_turn_idx])
+                            log_entry = {
+                                "env_idx": active_indices[original_turn_idx],
+                                "state": state_for_log,
+                                "action": path,  # The action is the full list of tokens
+                                "old_logprob": logprob.item(), # The logprob of the single sampled token
+                                "value": values[i].item(),
+                                "reward": 0.0,
+                                "finished": False,
+                                "truncated": False,
+                            }
+                            rollout_buffer.append(log_entry)
+                            turn_buffer_indices[original_turn_idx].append(len(rollout_buffer) - 1)
 
-                            # Create a log entry for EACH token in the generated path
-                            for j, path_token_id in enumerate(path):
-                                log_entry = {
-                                    "env_idx": active_indices[original_turn_idx],
-                                    "state": state_for_log,
-                                    "action": path_token_id,
-                                    "old_logprob": logprob if j == 0 else 0.0, # Logprob is non-zero only for the sampled token
-                                    "value": values[i].item(),
-                                    "reward": 0.0,
-                                    "done": False,
-                                }
-                                rollout_buffer.append(log_entry)
-                                turn_buffer_indices[original_turn_idx].append(len(rollout_buffer) - 1)
-
-                        # Update the master list of sequences and the partial command string
+                        # The state for the *next* generation step is still updated with the full autocompleted path.
                         turn_sequences[original_turn_idx].extend(path)
                         partial_commands_str[original_turn_idx] += self.tokenizer_helper.tokenizer.decode(path)
                         
                         # If that action leads to the EOS token, mark the turn as complete
-                        if tries[original_turn_idx].head.value == self.tokenizer_helper.tokenizer.eos_token_id:
+                        if tries[original_turn_idx].head.value == self.eos_token_id:
                             turn_complete_mask[original_turn_idx] = True
 
                 # --- 6. EXECUTE COMPLETED ACTIONS IN ENVIRONMENT ---
@@ -190,11 +210,18 @@ class ExperienceRoller:
                     
                     # --- 7. UPDATE FINAL REWARD & OUTER LOOP MASK ---
                     if not is_eval_mode and turn_buffer_indices[i]:
+                        # Divide the reward equally among all tokens in the action
+                        reward_per_token = reward / len(turn_buffer_indices[i])
+                        for buffer_idx in turn_buffer_indices[i]:
+                            rollout_buffer[buffer_idx]['reward'] = reward_per_token
                         final_buffer_idx = turn_buffer_indices[i][-1]
-                        rollout_buffer[final_buffer_idx]['reward'] = reward
-                        # The 'done' flag for GAE should reflect truncation
-                        is_truncated = current_lengths[original_env_idx] >= self.config.num_steps
-                        rollout_buffer[final_buffer_idx]['done'] = done or is_truncated
+                        
+                        is_max_steps = current_lengths[original_env_idx] >= self.config.num_steps
+                        # An episode is only truncated if it hits the max steps AND is not already finished
+                        is_truncated = is_max_steps and not done
+                        
+                        rollout_buffer[final_buffer_idx]['finished'] = done
+                        rollout_buffer[final_buffer_idx]['truncated'] = is_truncated
                     
                     game_observations[original_env_idx] = next_obs
                     

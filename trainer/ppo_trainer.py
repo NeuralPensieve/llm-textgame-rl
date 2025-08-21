@@ -3,6 +3,7 @@ import numpy as np
 import datetime
 import os
 import wandb
+import bitsandbytes as bnb
 from torch.amp import GradScaler
 
 from config import PPOConfig
@@ -28,7 +29,8 @@ class PPOTextWorldTrainer(BaseTrainer):
 
         # Optimizer with separate learning rates for model and value head
         param_groups = self.policy.get_separate_parameter_groups()
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+        # self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+        self.optimizer = bnb.optim.AdamW8bit(param_groups, weight_decay=0.01)
 
         # Learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

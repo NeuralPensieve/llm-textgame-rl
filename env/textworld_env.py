@@ -17,10 +17,11 @@ class TextWorldEnvironment:
     """
     _current_seed = None # Shared class variable for deterministic training seeds
 
-    def __init__(self, config: PPOConfig, game_file: str = None, is_eval_env: bool = False):
+    def __init__(self, config: PPOConfig, game_file: str = None, is_eval_env: bool = False, game_id: int = 0):
         self.config = config
         self.is_eval_env = is_eval_env
         self.repeatable = config.repeatable
+        self.game_id = game_id
         
         # Initialize the shared seed ONLY ONCE for repeatable training environments
         if self.repeatable and not self.is_eval_env and TextWorldEnvironment._current_seed is None:
@@ -37,12 +38,16 @@ class TextWorldEnvironment:
         self.history_len = config.history_len
         self.history = deque(maxlen=self.history_len)
         self.seed = None # Will be set during game creation
+        self.current_game_file = None  # Track the current game file for reloading
 
         request_infos = self._get_request_infos()
         if game_file:
+            self.current_game_file = game_file
             self.env = textworld.start(game_file, request_infos=request_infos)
         else:
-            self.env = self._create_simple_game()
+            new_game_file = self._create_simple_game()
+            self.current_game_file = new_game_file
+            self.env = textworld.start(new_game_file, request_infos=request_infos)
 
     def _get_request_infos(self):
         """Centralized method for requesting game info."""
@@ -76,14 +81,23 @@ class TextWorldEnvironment:
 
     def _create_simple_game(self):
         """Create a TextWorld game with configurable difficulty in memory"""
-        self._cleanup_temp_files()
+        # Only cleanup if we're creating a new game (not reusing an existing one)
+        if self.is_eval_env or not self.repeatable:
+            self._cleanup_temp_files()
 
         # Determine the seed based on the environment's purpose
         if self.is_eval_env or not self.repeatable:
             self.seed = random.randint(1, 1000000)
         else: # This is a repeatable training environment
+            if self.temp_game_file and os.path.exists(self.temp_game_file):
+                return self.temp_game_file
+            
+            # The seed is just the fixed base + the unique ID. Do not increment the base.
+            self.seed = TextWorldEnvironment._current_seed + self.game_id
+            
             TextWorldEnvironment._current_seed += 1
-            self.seed = TextWorldEnvironment._current_seed
+            self.seed = TextWorldEnvironment._current_seed + self.game_id
+            
         options = textworld.GameOptions()
         options.seeds = self.seed
         
@@ -99,31 +113,46 @@ class TextWorldEnvironment:
         options.theme = "house"
         
         # Create temporary directory for this game
-        self.temp_dir = tempfile.mkdtemp(prefix="textworld_")
+        if not self.temp_dir:
+            self.temp_dir = tempfile.mkdtemp(prefix="textworld_")
         self.temp_game_file = os.path.join(self.temp_dir, f"game_{self.seed}.z8")
         options.path = self.temp_game_file
         
         # Create the game
         game_file, _ = textworld.make(options)
             
-        return textworld.start(game_file, request_infos=self._get_request_infos())
+        return game_file
 
     def reset(self):
         """
-        Reset environment. If repeatable, reset the same game. 
+        Reset environment. If repeatable, reload the same game. 
         Otherwise, create a new game instance. Returns the initial state dictionary.
         """
         self.current_step, self.done, self.last_score = 0, False, 0
         self.history.clear()
 
-        # Hard reset for evaluation envs or non-repeatable training envs
+        # Close existing environment if it exists
+        if hasattr(self, 'env') and self.env is not None:
+            self.env.close()
+
+        # For evaluation or non-repeatable training: create a new game
         if self.is_eval_env or not self.repeatable:
-            if hasattr(self, 'env') and self.env is not None:
-                self.env.close()
             self._cleanup_temp_files()
-            self.env = self._create_simple_game()
+            new_game_file = self._create_simple_game()
+            self.current_game_file = new_game_file
+        else:
+            # For repeatable training: reuse the same game file
+            # If we don't have a game file yet, create one
+            if not self.current_game_file or not os.path.exists(self.current_game_file):
+                new_game_file = self._create_simple_game()
+                self.current_game_file = new_game_file
+            # Otherwise, reuse the existing game file (self.current_game_file)
         
-        # For both hard and soft resets, we need to call the underlying env's reset
+        # Always restart the environment with the current game file
+        request_infos = self._get_request_infos()
+        self.env = textworld.start(self.current_game_file, request_infos=request_infos)
+        
+        # Get the initial state
         self.game_state = self.env.reset()
         return self._extract_state(self.game_state)
 
@@ -276,7 +305,7 @@ class TextWorldEnvironment:
     def get_game_stats(self):
         """Get current game statistics"""
         return {
-            "difficulty": self.difficulty,
+            "difficulty": self.config.difficulty,
             "current_step": self.current_step,
             "max_steps": self.max_steps,
             "score": self.last_score,
@@ -286,9 +315,11 @@ class TextWorldEnvironment:
 
     def close(self):
         """Close the environment and clean up all resources"""
-        if hasattr(self.env, "close"):
+        if hasattr(self, 'env') and self.env is not None:
             self.env.close()
-        self._cleanup_temp_files()
+        # Only cleanup temp files for non-repeatable or eval environments
+        if self.is_eval_env or not self.repeatable:
+            self._cleanup_temp_files()
     
     def __del__(self):
         """Destructor to ensure cleanup on object deletion"""
