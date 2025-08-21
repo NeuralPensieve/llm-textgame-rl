@@ -135,8 +135,8 @@ class PPOTextWorldTrainer(BaseTrainer):
                 "normalized_iteration_duration": iteration_duration / rollout_size,
             })
 
-            if (iteration + 1) % self.config.save_interval == 0:
-                self.save_checkpoint(iteration)
+            # if (iteration + 1) % self.config.save_interval == 0:
+            #     self.save_checkpoint(iteration)
 
         wandb.finish()
         self.logger.info("Training completed!")

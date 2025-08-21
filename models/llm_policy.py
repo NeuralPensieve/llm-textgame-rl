@@ -1,4 +1,5 @@
 import copy
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +7,9 @@ from transformers import AutoModelForCausalLM, AutoConfig
 from typing import List, Tuple
 import logging
 from torch.amp import autocast
+
+# 🎯 1. ADD PEFT IMPORTS
+from peft import LoraConfig, get_peft_model, TaskType
 
 from config import PPOConfig
 from helper import format_prompt, TokenizerHelper
@@ -16,35 +20,26 @@ class LLMPolicy(nn.Module):
         self.config = config
         self.logger = logging.getLogger(__name__)
         self.tokenizer_helper = tokenizer_helper
+        self.device = device
 
         # Load the model configuration, ensuring use_cache=False for training efficiency.
         model_config = AutoConfig.from_pretrained(config.model_name, use_cache=False)
-        self.model = AutoModelForCausalLM.from_pretrained(
+
+        # Load the base model
+        base_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             config=model_config,
         ).to(device)
-
-        self.device = device
         
         # Enable gradient checkpointing on the main model to save memory during training.
-        self.model.gradient_checkpointing_enable()
+        base_model.gradient_checkpointing_enable()
 
-        # The value head predicts the value of a state (V(s)).
-        hidden_size = self.model.config.hidden_size
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, 1),
-        ).to(self.device)
+        self.model = base_model # Temporarily assign base_model
 
-        model_params = sum(p.numel() for p in self.model.parameters())
-        value_head_params = sum(p.numel() for p in self.value_head.parameters())
-        self.logger.info(f"Policy model parameters: {model_params / 1e6:.2f}M")
-        self.logger.info(f"Value head parameters: {value_head_params / 1e3:.2f}K")
-
+        # 🎯 3. CREATE REFERENCE MODEL (IF NEEDED) BEFORE APPLYING LORA
         if config.use_kl_penalty:
             self.logger.info("Creating reference model for KL penalty...")
+            # The reference model should be the original, un-adapted model
             self.reference_model = copy.deepcopy(self.model)
             for param in self.reference_model.parameters():
                 param.requires_grad = False
@@ -53,20 +48,103 @@ class LLMPolicy(nn.Module):
                 self.reference_model.gradient_checkpointing_disable()
             self.logger.info("Reference model created successfully.")
 
+        # 🎯 4. APPLY LORA ADAPTERS IF ENABLED
+        if self.config.lora_enabled:
+            self.logger.info("Applying LoRA adapters to the model...")
+            model_name_lower = self.config.model_name.lower()
+            if "qwen" in model_name_lower:
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            elif "gpt2" in model_name_lower or "dialogpt" in model_name_lower:
+                target_modules = ["c_attn", "c_proj"]
+            else:
+                raise ValueError(
+                    f"LoRA target modules are not defined for model: {self.config.model_name}. "
+                    "Please add the target module names in llm_policy.py."
+                )
+            # Define LoRA configuration
+            lora_config = LoraConfig(
+                r=self.config.lora_rank,
+                lora_alpha=self.config.lora_rank * 2, # A common practice
+                lora_dropout=self.config.lora_dropout,
+                target_modules=target_modules,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            # Wrap the model with LoRA adapters
+            self.model = get_peft_model(self.model, lora_config)
+            self.logger.info("LoRA applied successfully. Trainable parameters:")
+            self.model.print_trainable_parameters()
+        
+        # The value head predicts the value of a state (V(s)).
+        hidden_size = self.model.config.hidden_size
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, 1),
+        ).to(self.device)
+        # self.value_head = nn.Sequential(
+        #     nn.Linear(hidden_size, hidden_size),
+        #     nn.LayerNorm(hidden_size),  # Add normalization
+        #     nn.ReLU(),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(hidden_size, hidden_size // 2),
+        #     nn.LayerNorm(hidden_size // 2),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(hidden_size // 2, 1),
+        # ).to(self.device)
+
+        # Initialize value head to predict near zero
+        with torch.no_grad():
+            for layer in self.value_head:
+                if isinstance(layer, nn.Linear):
+                    nn.init.normal_(layer.weight, std=0.01)  # Very small weights
+                    nn.init.constant_(layer.bias, 0.0)
+            
+            # Set final layer bias to expected value
+            expected_value = -0.1  # Your average reward
+            self.value_head[-1].bias.data.fill_(expected_value)
+
+        model_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        value_head_params = sum(p.numel() for p in self.value_head.parameters())
+        self.logger.info(f"Policy model total parameters: {model_params / 1e6:.2f}M")
+        self.logger.info(f"Policy model trainable parameters: {trainable_params / 1e3:.2f}K")
+        self.logger.info(f"Value head parameters: {value_head_params / 1e3:.2f}K")
+
+
     def forward(self, input_ids, attention_mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a forward pass on the model. This is used by the ExperienceRoller
         for generating actions during rollouts.
         """
+        # autocast is still important for operations outside the main model, like the value head
         with autocast(self.device.type):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-            hidden_states = outputs.hidden_states[-1]
-            last_hidden = hidden_states[:, -1, :]
-            value = self.value_head(last_hidden)
+            # hidden_states = outputs.hidden_states[-1] 
+            # last_hidden = hidden_states[:, -1, :]
+            # # value = self.value_head(last_hidden)
+            # value = self.value_head(last_hidden.detach())  # To prevent backpropagation through value head
+
+            if self.config.disable_value_function:  # Add this config flag
+                # Return zeros for values
+                batch_size = input_ids.shape[0]
+                value = torch.zeros((batch_size, 1), device=self.device)
+            else:
+                hidden_states = outputs.hidden_states[-1] 
+                last_hidden = hidden_states[:, -1, :]
+                value = self.value_head(last_hidden.detach())  # To prevent backpropagation through value head
+
+                # DEBUG: Check if hidden states are informative
+                if random.random() < 0.01:  # 1% of time
+                    # Check if different actions produce different hidden states
+                    print(f"Hidden state norm: {last_hidden.norm(dim=-1).mean().item():.4f}")
+                    print(f"Hidden state std: {last_hidden.std().item():.4f}")
 
         return outputs.logits, value
 
@@ -79,33 +157,40 @@ class LLMPolicy(nn.Module):
         Re-evaluates the log probability of a batch of token-level actions
         for the PPO loss calculation.
         """
-        # Construct prompts from the (game_observation, partial_command) tuples
         prompts = [f"{format_prompt(obs)}{partial}" for obs, partial in composite_states]
         
-        # Tokenize the batch of prompts
         padded_batch = self.tokenizer_helper.tokenize_prompts(prompts)
         input_ids = padded_batch["input_ids"].to(self.device)
         attention_mask = padded_batch["attention_mask"].to(self.device)
         
         chosen_tokens_tensor = torch.LongTensor(chosen_tokens).to(self.device).unsqueeze(1)
 
-        # Perform a forward pass to get new logits and values under the current policy
         logits, values = self.forward(input_ids=input_ids, attention_mask=attention_mask)
         
         last_token_logits = logits[:, -1, :]
         log_probs = F.log_softmax(last_token_logits, dim=-1)
         
-        # Gather the logprobs of the specific tokens that were actually chosen
         chosen_log_probs = torch.gather(log_probs, 1, chosen_tokens_tensor).squeeze(1)
 
         return chosen_log_probs, values.squeeze(-1)
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates for the optimizer."""
-        return [
-            {"params": self.model.parameters(), "lr": self.config.learning_rate, "name": "pretrained"},
-            {"params": self.value_head.parameters(), "lr": self.config.learning_rate_value_head, "name": "value_head"},
-        ]
+
+        # 🎯 5. CRITICAL: ONLY PASS TRAINABLE (LORA) PARAMETERS TO THE OPTIMIZER
+        if self.config.lora_enabled:
+            # The optimizer should only see the trainable adapter parameters and the value head
+            model_trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+            return [
+                {"params": model_trainable_params, "lr": self.config.learning_rate, "name": "lora_adapters"},
+                {"params": self.value_head.parameters(), "lr": self.config.learning_rate_value_head, "name": "value_head"},
+            ]
+        else:
+            # Original behavior if LoRA is disabled
+            return [
+                {"params": self.model.parameters(), "lr": self.config.learning_rate, "name": "pretrained"},
+                {"params": self.value_head.parameters(), "lr": self.config.learning_rate_value_head, "name": "value_head"},
+            ]
     
     def get_reference_token_logprobs(
         self, 

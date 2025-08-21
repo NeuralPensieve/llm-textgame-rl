@@ -82,6 +82,18 @@ class PPOUpdater:
         
         advantages, returns = self.compute_advantages(rollout_buffer)
 
+        # # =================== ADD THIS BLOCK ===================
+        # # Normalize the returns to make the value function's target more stable
+        # returns_mean = returns.mean()
+        # returns_std = returns.std() + 1e-8 # Add epsilon for numerical stability
+        # returns = (returns - returns_mean) / returns_std
+        # # ======================================================
+
+        # ===== VALUE FUNCTION DIAGNOSTICS =====
+        if iteration % 5 == 0:  # Every 5 iterations
+            with torch.no_grad():
+                self.value_diagnostics(rollout_buffer, advantages, returns, iteration)
+
         # Convert to tensors
         advantages = torch.FloatTensor(advantages).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
@@ -210,3 +222,94 @@ class PPOUpdater:
             f"Initial KL divergence in eval mode is not zero: {initial_kl.item()}"
         self.logger.info("✅ Initial KL divergence sanity check passed.")
         self.policy.train() # Restore train mode
+
+    def value_diagnostics(self, rollout_buffer: List[Dict], advantages: np.ndarray, returns: np.ndarray, iteration: int, print_output: bool = False):
+        # Get values from buffer
+        values = np.array([exp["value"] for exp in rollout_buffer])
+        rewards = np.array([exp["reward"] for exp in rollout_buffer])
+        
+        # 1. REWARD DIAGNOSTICS (using the rewards variable now!)
+        reward_mean = rewards.mean()
+        reward_std = rewards.std()
+        reward_min = rewards.min()
+        reward_max = rewards.max()
+        non_zero_rewards = rewards[rewards != 0]
+        pct_non_zero = len(non_zero_rewards) / len(rewards) * 100 if len(rewards) > 0 else 0
+
+        if print_output:
+            print(f"\n===== REWARD DIAGNOSTICS (Iter {iteration}) =====")
+            print(f"Immediate Rewards: mean={reward_mean:.4f}, std={reward_std:.4f}")
+            print(f"Reward range: [{reward_min:.4f}, {reward_max:.4f}]")
+            print(f"Non-zero rewards: {pct_non_zero:.1f}% ({len(non_zero_rewards)}/{len(rewards)})")
+            if len(non_zero_rewards) > 0:
+                print(f"Non-zero reward mean: {non_zero_rewards.mean():.4f}")
+        
+        # 2. Value function accuracy metrics
+        value_mean = values.mean()
+        value_std = values.std()
+        returns_mean = returns.mean()
+        returns_std = returns.std()
+        
+        # 3. Correlation between values and returns
+        if len(values) > 1:
+            value_return_corr = np.corrcoef(values, returns)[0, 1]
+            # Also check correlation between values and immediate rewards
+            value_reward_corr = np.corrcoef(values, rewards)[0, 1]
+        else:
+            value_return_corr = 0.0
+            value_reward_corr = 0.0
+        
+        # 4. Explained variance (key metric!)
+        ev = 1 - (returns - values).var() / (returns.var() + 1e-8)
+        
+        # 5. Value function bias
+        bias = (values - returns).mean()
+        
+        # 6. Check if values are collapsing or exploding
+        values_range = values.max() - values.min()
+        
+        if print_output:
+            print(f"\n===== VALUE FUNCTION DIAGNOSTICS =====")
+            print(f"Values: mean={value_mean:.4f}, std={value_std:.4f}, range={values_range:.4f}")
+            print(f"Returns: mean={returns_mean:.4f}, std={returns_std:.4f}")
+            print(f"Correlation(Values, Returns): {value_return_corr:.4f}")
+            print(f"Correlation(Values, Immediate Rewards): {value_reward_corr:.4f}")
+            print(f"Explained Variance: {ev:.4f} (negative = harmful, 1.0 = perfect)")
+            print(f"Value Bias: {bias:.4f}")
+        
+        # 7. Check advantages distribution
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() 
+        if print_output:
+            print(f"Advantages: mean={adv_mean:.4f}, std={adv_std:.4f}")
+        
+        # 8. Episode-ending analysis
+        terminal_rewards = []
+        terminal_values = []
+        for i, exp in enumerate(rollout_buffer):
+            if exp["finished"] or exp["truncated"]:
+                terminal_rewards.append(rewards[i])
+                terminal_values.append(values[i])
+        
+        if terminal_rewards and print_output:
+            print(f"\n===== TERMINAL STATE ANALYSIS =====")
+            print(f"Terminal rewards: mean={np.mean(terminal_rewards):.4f}")
+            print(f"Terminal values predicted: mean={np.mean(terminal_values):.4f}")
+            print(f"Value prediction error at terminal: {np.mean(terminal_values) - np.mean(terminal_rewards):.4f}")
+        
+        # Log to wandb
+        wandb.log({
+            "iteration": iteration,
+            "value_diagnostics/explained_variance": ev,
+            "value_diagnostics/value_return_correlation": value_return_corr,
+            "value_diagnostics/value_reward_correlation": value_reward_corr,
+            "value_diagnostics/bias": bias,
+            "value_diagnostics/value_mean": value_mean,
+            "value_diagnostics/value_std": value_std,
+            "value_diagnostics/returns_mean": returns_mean,
+            "value_diagnostics/returns_std": returns_std,
+            "value_diagnostics/value_range": values_range,
+            "reward_diagnostics/reward_mean": reward_mean,
+            "reward_diagnostics/reward_std": reward_std,
+            "reward_diagnostics/pct_non_zero": pct_non_zero,
+        })

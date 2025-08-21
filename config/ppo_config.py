@@ -6,27 +6,25 @@ class PPOConfig:
     # Model settings
     # model_name: str = "microsoft/DialoGPT-small"
     model_name: str = "openai-community/gpt2"
-    # model_name: str = "google/gemma-3-270m-it"
     # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 1000  # Maximum sequence length, leaving 24 for generated actions
-    scoring_method: str = "action_token"  # Options: "helpful" or "action_token"
     dynamic_config: bool = False
     debug_mode: bool = False
     
 
     # Environment
-    num_envs: int = 32
+    num_envs: int = 16
     reuse_seed: bool = False
     env_seed: int = 142
     difficulty: str = 'easy'  # "easy", "medium", "hard"
     num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = True
+    repeatable: bool = False
     step_penalty: float = 0.1
     history_len: int = 3
     micro_batch_size: int = 8
 
     # PPO hyperparameters
-    batch_size: int = 16
+    batch_size: int = 8
     accumulation_steps: int = 16
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
@@ -42,9 +40,10 @@ class PPOConfig:
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
+    disable_value_function: bool = True  # Disable value function training
 
     # Loss settings
-    value_loss_coef: float = 2.0
+    value_loss_coef: float = 0.05
     entropy_coef: float = 0.05
     kl_coef: float = 0.1  # Start with 0.1, tune based on results
 

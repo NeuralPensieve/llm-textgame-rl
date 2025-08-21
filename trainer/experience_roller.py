@@ -202,7 +202,7 @@ class ExperienceRoller:
                         step_number = current_lengths[original_env_idx]
                         log_entry = [
                             f"--- Step {step_number} ---",
-                            f"STATE:\n{current_obs_for_log}",
+                            f"\n{current_obs_for_log}",
                             f"CHOSEN ACTION: {action_text} (Prob: {np.exp(turn_log_probs[i]):.8f})",
                             f"REWARD: {reward}\n",
                         ]
