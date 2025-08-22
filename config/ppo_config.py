@@ -5,8 +5,8 @@ from dataclasses import dataclass
 class PPOConfig:
     # Model settings
     # model_name: str = "microsoft/DialoGPT-small"
-    model_name: str = "openai-community/gpt2"
-    # model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    # model_name: str = "openai-community/gpt2"
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     max_length: int = 1000  # Maximum sequence length, leaving 24 for generated actions
     dynamic_config: bool = False
     debug_mode: bool = False
@@ -24,8 +24,8 @@ class PPOConfig:
     micro_batch_size: int = 8
 
     # PPO hyperparameters
-    batch_size: int = 8
-    accumulation_steps: int = 16
+    batch_size: int = 4
+    accumulation_steps: int = 32
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
     epsilon_clip: float = 0.2
@@ -36,11 +36,12 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # Training settings
-    num_iterations: int = 500
+    num_iterations: int = 400
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
     disable_value_function: bool = False  # Disable value function training
+    use_fp16: bool = True
 
     # Loss settings
     value_loss_coef: float = 0.05
@@ -51,6 +52,7 @@ class PPOConfig:
     lora_enabled: bool = False  # Enable LoRA
     lora_rank: int = 16  # Low-rank dimension for LoRA
     lora_dropout: float = 0.1  # Dropout for LoRA layers
+    lora_alpha: int = 64
 
     # Exploration
     epsilon: float = 0.0

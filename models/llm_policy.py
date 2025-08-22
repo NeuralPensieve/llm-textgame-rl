@@ -7,8 +7,6 @@ from transformers import AutoModelForCausalLM, AutoConfig
 from typing import List, Tuple
 import logging
 from torch.amp import autocast
-
-# 🎯 1. ADD PEFT IMPORTS
 from peft import LoraConfig, get_peft_model, TaskType
 
 from config import PPOConfig
@@ -25,18 +23,26 @@ class LLMPolicy(nn.Module):
         # Load the model configuration, ensuring use_cache=False for training efficiency.
         model_config = AutoConfig.from_pretrained(config.model_name, use_cache=False)
 
-        # Load the base model
+        model_kwargs = {
+            "config": model_config,
+            "torch_dtype": torch.float16 if config.use_fp16 else torch.float32,
+            }
+
+        if "qwen" in config.model_name.lower():
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        # Load the model by unpacking the kwargs dictionary
         base_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            config=model_config,
-        ).to(device)
+            **model_kwargs
+        ).to(self.device)
         
         # Enable gradient checkpointing on the main model to save memory during training.
         base_model.gradient_checkpointing_enable()
 
         self.model = base_model # Temporarily assign base_model
 
-        # 🎯 3. CREATE REFERENCE MODEL (IF NEEDED) BEFORE APPLYING LORA
+        # 3. CREATE REFERENCE MODEL (IF NEEDED) BEFORE APPLYING LORA
         if config.use_kl_penalty:
             self.logger.info("Creating reference model for KL penalty...")
             # The reference model should be the original, un-adapted model
@@ -48,12 +54,12 @@ class LLMPolicy(nn.Module):
                 self.reference_model.gradient_checkpointing_disable()
             self.logger.info("Reference model created successfully.")
 
-        # 🎯 4. APPLY LORA ADAPTERS IF ENABLED
+        # 4. APPLY LORA ADAPTERS IF ENABLED
         if self.config.lora_enabled:
             self.logger.info("Applying LoRA adapters to the model...")
             model_name_lower = self.config.model_name.lower()
             if "qwen" in model_name_lower:
-                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                target_modules = ["q_proj", "v_proj"]
             elif "gpt2" in model_name_lower or "dialogpt" in model_name_lower:
                 target_modules = ["c_attn", "c_proj"]
             else:
@@ -64,7 +70,7 @@ class LLMPolicy(nn.Module):
             # Define LoRA configuration
             lora_config = LoraConfig(
                 r=self.config.lora_rank,
-                lora_alpha=self.config.lora_rank * 2, # A common practice
+                lora_alpha=self.config.lora_alpha,
                 lora_dropout=self.config.lora_dropout,
                 target_modules=target_modules,
                 bias="none",
@@ -78,24 +84,18 @@ class LLMPolicy(nn.Module):
         # The value head predicts the value of a state (V(s)).
         hidden_size = self.model.config.hidden_size
         self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),  # Add normalization
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_size // 2, 1),
         ).to(self.device)
-        # self.value_head = nn.Sequential(
-        #     nn.Linear(hidden_size, hidden_size),
-        #     nn.LayerNorm(hidden_size),  # Add normalization
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(hidden_size, hidden_size // 2),
-        #     nn.LayerNorm(hidden_size // 2),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(hidden_size // 2, 1),
-        # ).to(self.device)
 
-        # Initialize value head to predict near zero
+        # Major improvement: Initialize value head to predict near zero
         with torch.no_grad():
             for layer in self.value_head:
                 if isinstance(layer, nn.Linear):
@@ -103,7 +103,7 @@ class LLMPolicy(nn.Module):
                     nn.init.constant_(layer.bias, 0.0)
             
             # Set final layer bias to expected value
-            expected_value = -0.1  # Your average reward
+            expected_value = -1 * self.config.step_penalty
             self.value_head[-1].bias.data.fill_(expected_value)
 
         model_params = sum(p.numel() for p in self.model.parameters())
@@ -140,12 +140,6 @@ class LLMPolicy(nn.Module):
                 last_hidden = hidden_states[:, -1, :]
                 value = self.value_head(last_hidden.detach())  # To prevent backpropagation through value head
 
-                # DEBUG: Check if hidden states are informative
-                if random.random() < 0.01:  # 1% of time
-                    # Check if different actions produce different hidden states
-                    print(f"Hidden state norm: {last_hidden.norm(dim=-1).mean().item():.4f}")
-                    print(f"Hidden state std: {last_hidden.std().item():.4f}")
-
         return outputs.logits, value
 
     def evaluate_tokens(
@@ -172,12 +166,16 @@ class LLMPolicy(nn.Module):
         
         chosen_log_probs = torch.gather(log_probs, 1, chosen_tokens_tensor).squeeze(1)
 
-        return chosen_log_probs, values.squeeze(-1)
+        # Get the sequence length from the padded input_ids tensor
+        batch_seq_len = input_ids.shape[1]
+
+        # Return the sequence length along with the other values
+        return chosen_log_probs, values.squeeze(-1), batch_seq_len
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates for the optimizer."""
 
-        # 🎯 5. CRITICAL: ONLY PASS TRAINABLE (LORA) PARAMETERS TO THE OPTIMIZER
+        # 5. CRITICAL: ONLY PASS TRAINABLE (LORA) PARAMETERS TO THE OPTIMIZER
         if self.config.lora_enabled:
             # The optimizer should only see the trainable adapter parameters and the value head
             model_trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())

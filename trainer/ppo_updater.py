@@ -96,6 +96,7 @@ class PPOUpdater:
         total_policy_loss, total_value_loss, total_combined_loss = 0, 0, 0
         num_updates = 0
         epoch_kl_values = []
+        batch_seq_lengths = []
 
         # PPO epochs
         for epoch in tqdm(range(self.config.ppo_epochs), desc="Running PPO Epochs"):
@@ -120,9 +121,10 @@ class PPOUpdater:
 
                 # Forward pass with the new method
                 with autocast(self.device.type):
-                    current_logprobs, current_values = self.policy.evaluate_tokens(
+                    current_logprobs, current_values, batch_seq_len = self.policy.evaluate_tokens(
                         batch_composite_states, batch_first_tokens
                     )
+                    batch_seq_lengths.append(batch_seq_len)
 
                     # --- KL Divergence Calculation ---
                     kl_div = torch.tensor(0.0, device=self.device)
@@ -155,15 +157,24 @@ class PPOUpdater:
                         + self.kl_coef * kl_div
                     ) / self.config.accumulation_steps
 
-                self.scaler.scale(total_loss).backward()
-
-                # Gradient accumulation step
-                if ((start // self.config.batch_size) + 1) % self.config.accumulation_steps == 0 or end >= len(rollout_buffer):
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
+                if self.config.use_fp16:
+                    # FP16 training without scaler
+                    total_loss.backward()
+                    
+                    if ((start // self.config.batch_size) + 1) % self.config.accumulation_steps == 0 or end >= len(rollout_buffer):
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                else:
+                    # Mixed precision training with scaler (your current approach)
+                    self.scaler.scale(total_loss).backward()
+                    
+                    if ((start // self.config.batch_size) + 1) % self.config.accumulation_steps == 0 or end >= len(rollout_buffer):
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)
 
                 # --- Update logging trackers ---
                 total_policy_loss += policy_loss.item()
@@ -182,6 +193,8 @@ class PPOUpdater:
                 "total_loss": total_combined_loss / num_updates,
                 "learning_rate": current_lr,
                 "kl_divergence": np.mean(epoch_kl_values) if epoch_kl_values else 0.0,
+                "diagnostics/avg_batch_seq_len": np.mean(batch_seq_lengths),
+                "diagnostics/max_batch_seq_len": max(batch_seq_lengths),
                 "dynamic/value_loss_coef": self.dynamic_config.get('value_loss_coef'),
             })
             self.logger.info(

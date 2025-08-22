@@ -37,8 +37,12 @@ class PPOTextWorldTrainer(BaseTrainer):
             self.optimizer, T_max=config.num_iterations, eta_min=1e-7
         )
 
-        # GradScaler for mixed-precision training
-        self.scaler = GradScaler(enabled=torch.cuda.is_available())
+        # Disable scaler if using full FP16
+        if config.use_fp16:
+            self.scaler = None  # Disable scaler for FP16
+        else:
+            # GradScaler for mixed-precision training
+            self.scaler = GradScaler(enabled=torch.cuda.is_available())
 
         # Training state
         self.temperature = config.temperature
@@ -181,7 +185,7 @@ class PPOTextWorldTrainer(BaseTrainer):
             "model_state_dict": self.policy.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
-            "scaler_state_dict": self.scaler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
             "config": self.config,
             "temperature": self.temperature,
         }
