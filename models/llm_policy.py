@@ -145,7 +145,8 @@ class LLMPolicy(nn.Module):
     def evaluate_tokens(
         self, 
         composite_states: List[Tuple[str, str]], 
-        chosen_tokens: List[int]
+        chosen_tokens: List[int],
+        valid_token_ids: List[List[int]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Re-evaluates the log probability of a batch of token-level actions
@@ -160,17 +161,38 @@ class LLMPolicy(nn.Module):
         chosen_tokens_tensor = torch.LongTensor(chosen_tokens).to(self.device).unsqueeze(1)
 
         logits, values = self.forward(input_ids=input_ids, attention_mask=attention_mask)
+        last_token_logits = logits[:, -1, :].clone()
+
+        # Create a boolean mask for valid tokens
+        batch_size, vocab_size = last_token_logits.shape
+        valid_mask = torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=self.device)
         
-        last_token_logits = logits[:, -1, :]
-        log_probs = F.log_softmax(last_token_logits, dim=-1)
+        for i, valid_ids in enumerate(valid_token_ids):
+            valid_mask[i, valid_ids] = True
         
+        # Apply -inf to invalid positions
+        masked_logits = last_token_logits.masked_fill(~valid_mask, float('-inf'))
+        
+        # Compute probabilities and log probabilities
+        probs = F.softmax(masked_logits, dim=-1)
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        
+        # Key fix: Set log_probs to 0 where probs are 0 to avoid 0 * -inf = NaN
+        # This is mathematically sound since lim(p→0) p*log(p) = 0
+        safe_log_probs = torch.where(valid_mask, log_probs, torch.zeros_like(log_probs))
+        
+        # Compute entropy: H = -sum(p * log(p))
+        entropy = -(probs * safe_log_probs).sum(dim=-1)
+        
+        # Get chosen log probabilities
+        chosen_tokens_tensor = torch.LongTensor(chosen_tokens).to(self.device).unsqueeze(1)
         chosen_log_probs = torch.gather(log_probs, 1, chosen_tokens_tensor).squeeze(1)
 
         # Get the sequence length from the padded input_ids tensor
         batch_seq_len = input_ids.shape[1]
 
         # Return the sequence length along with the other values
-        return chosen_log_probs, values.squeeze(-1), batch_seq_len
+        return chosen_log_probs, values.squeeze(-1), entropy, batch_seq_len
 
     def get_separate_parameter_groups(self):
         """Get parameter groups with different learning rates for the optimizer."""

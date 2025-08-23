@@ -93,7 +93,7 @@ class PPOUpdater:
         old_logprobs = torch.FloatTensor([exp["old_logprob"] for exp in rollout_buffer]).to(self.device)
 
         # --- Initialize logging variables ---
-        total_policy_loss, total_value_loss, total_combined_loss = 0, 0, 0
+        total_policy_loss, total_value_loss, total_entropy_loss, total_combined_loss = 0, 0, 0, 0
         num_updates = 0
         epoch_kl_values = []
         batch_seq_lengths = []
@@ -115,14 +115,15 @@ class PPOUpdater:
                 # Prepare inputs for the new policy evaluation method
                 batch_composite_states = [exp["state"] for exp in batch_experiences]
                 batch_chosen_tokens = [exp["action"] for exp in batch_experiences]
+                batch_valid_token_ids = [exp["valid_token_ids"] for exp in batch_experiences]
 
                 # Only the get the first sampled token, not the following deterministic tokens
                 batch_first_tokens = [tokens[0] for tokens in batch_chosen_tokens]
 
                 # Forward pass with the new method
                 with autocast(self.device.type):
-                    current_logprobs, current_values, batch_seq_len = self.policy.evaluate_tokens(
-                        batch_composite_states, batch_first_tokens
+                    current_logprobs, current_values, entropy, batch_seq_len = self.policy.evaluate_tokens(
+                        batch_composite_states, batch_first_tokens, batch_valid_token_ids
                     )
                     batch_seq_lengths.append(batch_seq_len)
 
@@ -149,13 +150,19 @@ class PPOUpdater:
                     
                     policy_loss = -torch.min(surr1, surr2).mean()
                     value_loss = F.mse_loss(current_values.view(-1), batch_returns)
+                    entropy_loss = -entropy.mean()
 
 
                     total_loss = (
                         policy_loss
                         + self.dynamic_config.get('value_loss_coef') * value_loss
-                        + self.kl_coef * kl_div
+                        + self.config.entropy_coef * entropy_loss
+                        # + self.kl_coef * kl_div
                     ) / self.config.accumulation_steps
+
+                    if total_loss.isnan():
+                        self.logger.warning("NaN detected in total_loss. Skipping this batch.")
+                        continue
 
                 if self.config.use_fp16:
                     # FP16 training without scaler
@@ -179,6 +186,7 @@ class PPOUpdater:
                 # --- Update logging trackers ---
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
+                total_entropy_loss += entropy_loss.item()
                 total_combined_loss += total_loss.item() * self.config.accumulation_steps
                 num_updates += 1
 
@@ -190,6 +198,7 @@ class PPOUpdater:
                 "iteration": iteration,
                 "policy_loss": total_policy_loss / num_updates,
                 "value_loss": total_value_loss / num_updates,
+                "entropy": -total_entropy_loss / num_updates,
                 "total_loss": total_combined_loss / num_updates,
                 "learning_rate": current_lr,
                 "kl_divergence": np.mean(epoch_kl_values) if epoch_kl_values else 0.0,

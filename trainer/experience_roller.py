@@ -120,6 +120,13 @@ class ExperienceRoller:
                 # This list will hold the token sequences for all envs active in this turn
                 turn_sequences = [seq.tolist() for seq in padded_batch["input_ids"]]
 
+                # Generate unconstrained actions for comparison during evaluation
+                unconstrained_results = {}
+                if is_eval_mode:
+                    unconstrained_results = self._generate_unconstrained_comparison(
+                        active_indices, turn_sequences, num_sample_games, temperature
+                    )
+
                 # --- INNER LOOP: Generates one multi-token action for all active envs ---
                 while not all(turn_complete_mask):
                     
@@ -134,13 +141,14 @@ class ExperienceRoller:
                     
                     # --- 3. GET POLICY OUTPUT ---
                     batch_tries = [tries[i] for i in active_turn_indices]
-                    token_mask = generate_mask(batch_tries, self.policy.model.config.vocab_size).to(self.policy.device)
+                    token_mask, all_valid_token_ids = generate_mask(batch_tries, self.policy.model.config.vocab_size)
+                    token_mask = token_mask.to(self.policy.device)
 
                     batch_input_ids = batch_input_ids.to(self.policy.device)
                     batch_attention_mask = batch_attention_mask.to(self.policy.device)
                     
                     with torch.no_grad(), autocast(self.policy.device.type):
-                        logits, values = self.policy.forward(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+                        logits, values = self._safe_forward(batch_input_ids, batch_attention_mask)
                     
                     last_token_logits = logits[:, -1, :] + token_mask.to(dtype=logits.dtype)
                     
@@ -148,7 +156,7 @@ class ExperienceRoller:
                     temp_to_use = 0.0 if is_eval_mode else temperature
                     next_token_ids, chosen_log_probs = self._temperature_sampling(last_token_logits, temp_to_use)
 
-                    for i, (token_id, logprob) in enumerate(zip(next_token_ids, chosen_log_probs)):
+                    for i, (token_id, logprob, valid_token_ids) in enumerate(zip(next_token_ids, chosen_log_probs, all_valid_token_ids)):
                         original_turn_idx = active_turn_indices[i]
 
                         # Add the logprob of the SAMPLED token to the accumulator
@@ -164,6 +172,7 @@ class ExperienceRoller:
                                 "action": path,  # The action is the full list of tokens
                                 "old_logprob": logprob.item(), # The logprob of the single sampled token
                                 "value": values[i].item(),
+                                "valid_token_ids": valid_token_ids,
                                 "reward": 0.0,
                                 "finished": False,
                                 "truncated": False,
@@ -206,6 +215,13 @@ class ExperienceRoller:
                             f"CHOSEN ACTION: {action_text} (Prob: {np.exp(turn_log_probs[i]):.8f})",
                             f"REWARD: {reward}\n",
                         ]
+
+                        # Add unconstrained generation comparison if available
+                        if original_env_idx in unconstrained_results:
+                            unconstrained_text = unconstrained_results[original_env_idx]
+                            log_entry.append(f"UNCONSTRAINED GENERATION: {unconstrained_text}")
+                        
+                        log_entry.append(f"REWARD: {reward}\n")
                         game_logs[original_env_idx].extend(log_entry)
                     
                     # --- 7. UPDATE FINAL REWARD & OUTER LOOP MASK ---
@@ -249,6 +265,50 @@ class ExperienceRoller:
             env.close()
 
         return rollout_buffer, finished_episodes
+    
+    # In experience_roller.py, inside the ExperienceRoller class
+
+    def _safe_forward(self, batch_input_ids, batch_attention_mask):
+        """
+        Performs a forward pass, handling potential CUDA OOM errors by splitting the batch.
+        """
+        try:
+            torch.cuda.empty_cache()
+            # Attempt the forward pass with the given batch
+            return self.policy.forward(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+        
+        except torch.cuda.OutOfMemoryError:
+            # If an OOM error occurs, clear the cache
+            torch.cuda.empty_cache()
+            
+            batch_size = batch_input_ids.shape[0]
+            
+            # If batch size is 1, we can't split further. The sequence is just too long.
+            if batch_size <= 1:
+                print(f"ERROR: CUDA OOM with a single sequence of length {batch_input_ids.shape[1]}. Cannot recover. Skipping.")
+                # Return dummy tensors of the correct shape but on CPU to avoid further GPU errors
+                # The rest of the loop logic will handle this gracefully.
+                logits_dummy = torch.zeros((1, batch_input_ids.shape[1], self.policy.model.config.vocab_size), dtype=torch.float32)
+                values_dummy = torch.zeros((1, 1), dtype=torch.float32)
+                return logits_dummy, values_dummy
+
+            print(f"WARNING: CUDA OOM detected with batch size {batch_size}. Splitting batch and retrying.")
+            
+            # Split the batch in half
+            mid = batch_size // 2
+            
+            # Recursively call on the first half
+            logits1, values1 = self._safe_forward(
+                batch_input_ids[:mid], batch_attention_mask[:mid]
+            )
+            
+            # Recursively call on the second half
+            logits2, values2 = self._safe_forward(
+                batch_input_ids[mid:], batch_attention_mask[mid:]
+            )
+            
+            # Concatenate the results and return
+            return torch.cat((logits1, logits2), dim=0), torch.cat((values1, values2), dim=0)
 
     def _temperature_sampling(self, logits: torch.Tensor, temperature: float) -> Tuple[np.ndarray, np.ndarray]:
         """Applies temperature sampling to logits and returns token IDs and their log probabilities."""
@@ -263,3 +323,68 @@ class ExperienceRoller:
         chosen_log_probs = torch.gather(log_probs, 1, next_token_ids.view(-1, 1)).squeeze(1)
         
         return next_token_ids.cpu().numpy(), chosen_log_probs.cpu().numpy()
+    
+    def _generate_unconstrained_comparison(self, active_indices: List[int], turn_sequences: List[List[int]], 
+                                          num_sample_games: int, temperature: float) -> Dict[int, Tuple[str, float]]:
+        """
+        Generate unconstrained sequences for comparison during evaluation.
+        
+        Args:
+            active_indices: List of environment indices that are still active
+            turn_sequences: Current token sequences for each active environment
+            num_sample_games: Number of games to generate comparisons for
+            temperature: Sampling temperature
+            
+        Returns:
+            Dict mapping env_idx to (unconstrained_text, total_prob)
+        """
+        unconstrained_results = {}
+        
+        # Only generate for sample games
+        sample_env_indices = [idx for idx in active_indices if idx < num_sample_games]
+        if not sample_env_indices:
+            return unconstrained_results
+        
+        # Get the corresponding turn sequence indices
+        sample_turn_indices = [active_indices.index(env_idx) for env_idx in sample_env_indices]
+        sample_sequences = [turn_sequences[i] for i in sample_turn_indices]
+        
+        # Generate unconstrained sequences
+        for i, (env_idx, turn_idx) in enumerate(zip(sample_env_indices, sample_turn_indices)):
+            current_sequence = sample_sequences[i].copy()
+            total_log_prob = 0.0
+            generated_tokens = []
+            
+            # Generate up to 5 tokens or until EOS
+            for _ in range(5):
+                # Prepare input
+                input_ids = torch.tensor([current_sequence]).to(self.device)
+                attention_mask = torch.ones_like(input_ids).to(self.device)
+                
+                # Forward pass without constraints
+                with torch.no_grad(), autocast(self.policy.device.type):
+                    logits, _ = self.policy.forward(input_ids=input_ids, attention_mask=attention_mask)
+                
+                last_token_logits = logits[:, -1, :]
+                
+                # Sample token
+                temp_to_use = 0.0  # Use greedy for evaluation
+                next_token_ids, chosen_log_probs = self._temperature_sampling(last_token_logits, temp_to_use)
+                
+                token_id = next_token_ids[0]
+                log_prob = chosen_log_probs[0]
+                
+                generated_tokens.append(token_id)
+                current_sequence.append(token_id)
+                total_log_prob += log_prob
+                
+                # Stop if EOS token
+                if token_id == self.eos_token_id:
+                    break
+            
+            # Decode the generated sequence
+            unconstrained_text = self.tokenizer_helper.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            
+            unconstrained_results[env_idx] = unconstrained_text
+        
+        return unconstrained_results

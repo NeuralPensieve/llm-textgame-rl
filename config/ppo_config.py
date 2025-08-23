@@ -7,24 +7,32 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-small"
     # model_name: str = "openai-community/gpt2"
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    max_length: int = 1000  # Maximum sequence length, leaving 24 for generated actions
+    max_length: int = 650  # Maximum sequence length
     dynamic_config: bool = False
     debug_mode: bool = False
+    
+    # Easy settings
+    difficulty: str = 'easy'  # "easy", "medium", "hard"
+    num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
+    repeatable: bool = False
+    num_iterations: int = 100
+    
+    # Medium settings
+    # difficulty: str = 'medium'  # "easy", "medium", "hard"
+    # num_steps: int = 32  # Steps per rollout. 8 for easy, and 16 for medium
+    # repeatable: bool = False
+    # num_iterations: int = 2000
     
 
     # Environment
     num_envs: int = 16
     reuse_seed: bool = False
     env_seed: int = 142
-    difficulty: str = 'easy'  # "easy", "medium", "hard"
-    num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = False
     step_penalty: float = 0.1
     history_len: int = 3
-    micro_batch_size: int = 8
 
     # PPO hyperparameters
-    batch_size: int = 4
+    batch_size: int = 2
     accumulation_steps: int = 32
     learning_rate: float = 1e-5
     learning_rate_value_head: float = 1e-4
@@ -36,7 +44,6 @@ class PPOConfig:
     normalize_advantage: bool = True
 
     # Training settings
-    num_iterations: int = 400
     save_interval: int = 50
     log_interval: int = 10
     eval_interval: int = 5
@@ -45,7 +52,7 @@ class PPOConfig:
 
     # Loss settings
     value_loss_coef: float = 0.05
-    entropy_coef: float = 0.05
+    entropy_coef: float = 0.01
     kl_coef: float = 0.1  # Start with 0.1, tune based on results
 
     # LoRA settings
@@ -64,7 +71,7 @@ class PPOConfig:
 
 
     # Evaluation
-    num_eval_episodes: int = 20
+    num_eval_episodes: int = 16
     num_sample_games: int = 5
 
     # KL Penalty settings

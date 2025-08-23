@@ -60,11 +60,13 @@ class Trie:
 
 def generate_mask(tries: List[Trie], vocab_size: int, data_type=torch.float32) -> torch.Tensor:
     mask = torch.full((len(tries), vocab_size), float('-inf')).to(dtype=data_type)
+    token_ids = []
     for i, trie in enumerate(tries):
         valid_tokens = list(trie.head.children.keys())
         if valid_tokens:
             mask[i, valid_tokens] = 0.0
-    return mask
+            token_ids.append(valid_tokens)
+    return mask, token_ids
 
 
 def tokenize_actions_for_trie(action_list: List[str], tokenizer: AutoTokenizer) -> List[List[int]]:
