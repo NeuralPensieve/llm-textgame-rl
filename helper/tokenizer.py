@@ -27,10 +27,12 @@ class TokenizerHelper:
             # 2. If it's too long, start trimming the history
             while len(input_ids) > max_len:
                 # Find the history string using regex
-                match = re.search(r"HISTORY: (.*?)\nSTATE:", prompt, re.DOTALL)
+                match = re.search(r"Before: (.*?)\nNow:", prompt, re.DOTALL)
                 if not match:
-                    raise ValueError('State too long, and there is no HISTORY to cut')
-
+                    print(f"⚠️  Warning: No HISTORY found in prompt, but length {len(input_ids)} exceeds max {max_len}.")
+                    print(f"Prompt:\n{prompt}\n")
+                    break
+                
                 history_str = match.group(1).strip()
                 
                 # Split history into chunks and remove the oldest (the first one)

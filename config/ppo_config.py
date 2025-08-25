@@ -7,23 +7,22 @@ class PPOConfig:
     # model_name: str = "microsoft/DialoGPT-small"
     # model_name: str = "openai-community/gpt2"
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
-    max_length: int = 650  # Maximum sequence length
+    max_length: int = 750  # Maximum sequence length
     dynamic_config: bool = False
     debug_mode: bool = False
     
     # Easy settings
-    difficulty: str = 'easy'  # "easy", "medium", "hard"
-    num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = False
-    num_iterations: int = 100
+    # difficulty: str = 'easy'  # "easy", "medium", "hard"
+    # num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
+    # repeatable: bool = False
+    # num_iterations: int = 100
     
     # Medium settings
-    # difficulty: str = 'medium'  # "easy", "medium", "hard"
-    # num_steps: int = 32  # Steps per rollout. 8 for easy, and 16 for medium
-    # repeatable: bool = False
-    # num_iterations: int = 2000
+    difficulty: str = 'medium'  # "easy", "medium", "hard"
+    num_steps: int = 32  # Steps per rollout. 8 for easy, and 16 for medium
+    repeatable: bool = False
+    num_iterations: int = 1000
     
-
     # Environment
     num_envs: int = 16
     reuse_seed: bool = False

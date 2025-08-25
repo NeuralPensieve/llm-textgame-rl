@@ -246,13 +246,12 @@ class TextWorldEnvironment:
                     history_parts.append(f" > {action}")
                 last_state = state
             history_str = "".join(history_parts)
-        actions_str = " | ".join(state_dict["available actions"])
+            
         return (
-            f"OBJECTIVE: {state_dict['objective']}\n"
-            f"HISTORY: {history_str}\n"
-            f"STATE: {state_dict['current state']}\n"
-            f"INVENTORY: {state_dict['inventory']}\n"
-            f"ACTIONS: {actions_str}"
+            f"{state_dict['objective']}\n"
+            f"Before: {history_str}\n"
+            f"Now: {state_dict['current state']}\n"
+            f"{state_dict['inventory']}"
         )
 
     def _clean_text(self, text: str) -> str:
