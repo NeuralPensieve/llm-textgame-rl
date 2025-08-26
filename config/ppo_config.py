@@ -14,8 +14,8 @@ class PPOConfig:
     # Easy settings
     difficulty: str = 'easy'  # "easy", "medium", "hard"
     num_steps: int = 8  # Steps per rollout. 8 for easy, and 16 for medium
-    repeatable: bool = False
-    num_iterations: int = 100
+    repeatable: bool = True
+    num_iterations: int = 150
     
     # Medium settings
     # difficulty: str = 'medium'  # "easy", "medium", "hard"

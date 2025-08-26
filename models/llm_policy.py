@@ -126,10 +126,6 @@ class LLMPolicy(nn.Module):
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-            # hidden_states = outputs.hidden_states[-1] 
-            # last_hidden = hidden_states[:, -1, :]
-            # # value = self.value_head(last_hidden)
-            # value = self.value_head(last_hidden.detach())  # To prevent backpropagation through value head
 
             if self.config.disable_value_function:  # Add this config flag
                 # Return zeros for values
