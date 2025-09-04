@@ -2,6 +2,8 @@
 
 This project implements a token-level Proximal Policy Optimization (PPO) training pipeline for Language Models (LLMs) in the TextWorld environment. It leverages PyTorch, Hugging Face Transformers, and Weights & Biases (WandB) for experiment tracking.
 
+A detailed blog post about this work can be found here: [https://neuralpensieve.github.io/2025/08/26/rl-llm-textworld.html](https://neuralpensieve.github.io/2025/08/26/rl-llm-textworld.html)
+
 ## Overview
 
 The project is structured into several key modules:
